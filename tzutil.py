@@ -1,5 +1,5 @@
 """Yerel saat yardimcilari. Depolama hep epoch UTC; gosterim yerel (LOCAL_TZ)."""
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import config
@@ -28,4 +28,4 @@ def local_hour(ts):
 
 
 def now_ts():
-    return int(datetime.now(timezone.utc).timestamp())
+    return int(datetime.now(UTC).timestamp())
