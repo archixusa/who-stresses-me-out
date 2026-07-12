@@ -6,7 +6,6 @@ Each source exposes ``fetch(days) -> list[Meeting]``. ``auto_sync`` writes those
 correlates them with WHOOP data unchanged.
 """
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -14,8 +13,8 @@ class Meeting:
     ext_id: str            # source-side id (for de-duplication)
     ts_start: int          # epoch, UTC
     ts_end: int
-    person: Optional[str]  # who you were with
-    title: Optional[str]
+    person: str | None  # who you were with
+    title: str | None
     tag: str               # context label (e.g. "work", "slack")
     source: str            # "google_calendar" | "slack" | ...
 

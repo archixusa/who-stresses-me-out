@@ -7,7 +7,7 @@ Kirilirsa SADECE bu dosya guncellenir; botun geri kalani (loglama) etkilenmez.
 Onemli: dahili HR sorgusu ~7 gunluk pencere limitine sahiptir -> istekleri chunk'lariz.
 """
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import config
 
@@ -91,4 +91,4 @@ def fetch_hr(start_date, end_date, step=60, debug=False):
 
 
 def today_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")

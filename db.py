@@ -17,14 +17,27 @@ CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_start   INTEGER NOT NULL,
     ts_end     INTEGER,
-    friend     TEXT,
+    friend     TEXT,                     -- birincil kisi (geriye uyumluluk); tumu event_participants'ta
     location   TEXT,
     topic      TEXT,
     tag        TEXT,
-    feeling    INTEGER,
+    feeling    INTEGER,                  -- LEGACY/DEPRECATED: artik yazilmaz/kullanilmaz (eski veri korunur)
     source     TEXT DEFAULT 'manual',   -- manual | google_calendar | slack | ...
     ext_id     TEXT,                     -- kaynak-taraf id (dedup icin)
+    caffeine   TEXT,                     -- opsiyonel confounder: none | low | high
+    alcohol    INTEGER,                  -- opsiyonel confounder: 0/1
+    illness    INTEGER,                  -- opsiyonel confounder: 0/1
+    commute    INTEGER,                  -- opsiyonel confounder: 0/1 (yuruyus/ulasim)
+    notes      TEXT,                     -- opsiyonel serbest not
     created_at INTEGER NOT NULL
+);
+-- Cok katilimcili gorusme: bir event'in tum katilimcilari (birincil dahil)
+CREATE TABLE IF NOT EXISTS event_participants (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    is_primary INTEGER DEFAULT 0,
+    ord        INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS shortcuts (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +104,12 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(events)").fetchall()]
         for col, ddl in (("tag", "tag TEXT"),
                          ("source", "source TEXT DEFAULT 'manual'"),
-                         ("ext_id", "ext_id TEXT")):
+                         ("ext_id", "ext_id TEXT"),
+                         ("caffeine", "caffeine TEXT"),
+                         ("alcohol", "alcohol INTEGER"),
+                         ("illness", "illness INTEGER"),
+                         ("commute", "commute INTEGER"),
+                         ("notes", "notes TEXT")):
             if col not in cols:
                 try:
                     conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
@@ -103,6 +121,20 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_ext "
             "ON events(source, ext_id) WHERE ext_id IS NOT NULL"
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_participants_event "
+                     "ON event_participants(event_id)")
+        # Eski events.friend degerlerini bir kez event_participants'a tasi (birincil)
+        backfilled = conn.execute("SELECT 1 FROM meta WHERE key='participants_backfilled'").fetchone()
+        if not backfilled:
+            rows = conn.execute(
+                "SELECT id, friend FROM events WHERE friend IS NOT NULL AND friend != '' "
+                "AND id NOT IN (SELECT DISTINCT event_id FROM event_participants)"
+            ).fetchall()
+            conn.executemany(
+                "INSERT INTO event_participants(event_id, name, is_primary, ord) VALUES (?,?,1,0)",
+                [(r["id"], r["friend"]) for r in rows],
+            )
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('participants_backfilled','1')")
         # Varsayilan kisayollari SADECE bir kez yukle (kullanici hepsini silerse geri gelmesin)
         seeded = conn.execute("SELECT 1 FROM meta WHERE key='shortcuts_seeded'").fetchone()
         if not seeded:
@@ -137,16 +169,105 @@ def list_names(table, limit=12):
 
 
 # --- events ---
-def add_event(ts_start, friend=None, location=None, topic=None, feeling=None,
-              created_at=None, ts_end=None, tag=None, source="manual", ext_id=None):
+def _norm_names(names):
+    """Kisi adlarini temizler, sirasi bozulmadan tekrarsizlastirir."""
+    out, seen = [], set()
+    for n in names or []:
+        n = (n or "").strip()
+        if n and n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+    return out
+
+
+def _insert_participants(conn, event_id, names):
+    conn.executemany(
+        "INSERT INTO event_participants(event_id, name, is_primary, ord) VALUES (?,?,?,?)",
+        [(event_id, n, 1 if i == 0 else 0, i) for i, n in enumerate(names)],
+    )
+
+
+def add_event(ts_start, friend=None, participants=None, location=None, topic=None,
+              created_at=None, ts_end=None, tag=None, source="manual", ext_id=None,
+              caffeine=None, alcohol=None, illness=None, commute=None, notes=None):
+    """Yeni event ekler. feeling YAZILMAZ (legacy alan). participants verilirse ilki
+    birincil kabul edilir; verilmezse friend birincil olur."""
+    names = _norm_names(participants) if participants else _norm_names([friend])
+    primary = names[0] if names else None
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO events(ts_start, ts_end, friend, location, topic, tag, feeling, "
-            "source, ext_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (ts_start, ts_end, friend, location, topic, tag, feeling,
-             source, ext_id, created_at or ts_start),
+            "INSERT INTO events(ts_start, ts_end, friend, location, topic, tag, source, "
+            "ext_id, caffeine, alcohol, illness, commute, notes, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ts_start, ts_end, primary, location, topic, tag, source, ext_id,
+             caffeine, alcohol, illness, commute, notes, created_at or ts_start),
         )
-        return cur.lastrowid
+        eid = cur.lastrowid
+        _insert_participants(conn, eid, names)
+        return eid
+
+
+# --- katilimcilar (cok kisili gorusme) ---
+def get_event_participants(event_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT name, is_primary FROM event_participants WHERE event_id=? ORDER BY ord, id",
+            (event_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def participant_names(event):
+    """Bir event dict'i icin katilimci adlari; participant kaydi yoksa friend'e duser."""
+    parts = get_event_participants(event["id"])
+    if parts:
+        return [p["name"] for p in parts]
+    return _norm_names([event.get("friend")])
+
+
+def add_participant(event_id, name):
+    name = (name or "").strip()
+    if not name:
+        return False
+    with get_conn() as conn:
+        existing = [r["name"].lower() for r in conn.execute(
+            "SELECT name FROM event_participants WHERE event_id=?", (event_id,)).fetchall()]
+        if name.lower() in existing:
+            return False
+        mx = conn.execute("SELECT COALESCE(MAX(ord),-1)+1 n FROM event_participants "
+                          "WHERE event_id=?", (event_id,)).fetchone()["n"]
+        primary = 1 if mx == 0 else 0
+        conn.execute("INSERT INTO event_participants(event_id, name, is_primary, ord) "
+                     "VALUES (?,?,?,?)", (event_id, name, primary, mx))
+        if primary:  # ilk katilimci ayni zamanda events.friend olsun
+            conn.execute("UPDATE events SET friend=? WHERE id=?", (name, event_id))
+    return True
+
+
+def set_participants(event_id, names):
+    """Bir event'in katilimcilarini tumden degistirir (ilk = birincil)."""
+    names = _norm_names(names)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM event_participants WHERE event_id=?", (event_id,))
+        _insert_participants(conn, event_id, names)
+        conn.execute("UPDATE events SET friend=? WHERE id=?",
+                     (names[0] if names else None, event_id))
+
+
+def set_event_confounders(event_id, caffeine=None, alcohol=None, illness=None,
+                          commute=None, notes=None):
+    """Verilen (None olmayan) confounder alanlarini gunceller; digerlerine dokunmaz."""
+    fields, vals = [], []
+    for col, val in (("caffeine", caffeine), ("alcohol", alcohol), ("illness", illness),
+                     ("commute", commute), ("notes", notes)):
+        if val is not None:
+            fields.append(f"{col}=?")
+            vals.append(val)
+    if not fields:
+        return
+    vals.append(event_id)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE events SET {', '.join(fields)} WHERE id=?", vals)
 
 
 def upsert_external_event(source, ext_id, ts_start, ts_end, friend=None, topic=None,
@@ -197,11 +318,6 @@ def delete_shortcut(shortcut_id):
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM shortcuts WHERE id=?", (shortcut_id,))
         return cur.rowcount > 0
-
-
-def set_event_feeling(event_id, feeling):
-    with get_conn() as conn:
-        conn.execute("UPDATE events SET feeling=? WHERE id=?", (feeling, event_id))
 
 
 def set_event_topic(event_id, topic):
@@ -273,6 +389,7 @@ def recent_events(limit=10):
 
 def delete_event(event_id):
     with get_conn() as conn:
+        conn.execute("DELETE FROM event_participants WHERE event_id=?", (event_id,))
         cur = conn.execute("DELETE FROM events WHERE id=?", (event_id,))
         return cur.rowcount > 0
 
@@ -336,3 +453,38 @@ def workouts_overlapping(start_ts, end_ts):
             (end_ts, start_ts),
         ).fetchall()
     return [(r["ts_start"], r["ts_end"]) for r in rows]
+
+
+# --- veri yasam dongusu: ozet / export / sil ---
+def data_summary():
+    """Saklanan lokal verinin ozeti (/verilerim icin)."""
+    with get_conn() as conn:
+        def c(q):
+            return conn.execute(q).fetchone()[0]
+        hr_min = conn.execute("SELECT MIN(ts) FROM hr_cache").fetchone()[0]
+        hr_max = conn.execute("SELECT MAX(ts) FROM hr_cache").fetchone()[0]
+        return {
+            "events": c("SELECT COUNT(*) FROM events"),
+            "participants": c("SELECT COUNT(*) FROM event_participants"),
+            "hr_samples": c("SELECT COUNT(*) FROM hr_cache"),
+            "hr_from": hr_min, "hr_to": hr_max,
+            "daily_days": c("SELECT COUNT(*) FROM daily"),
+            "workouts": c("SELECT COUNT(*) FROM workouts"),
+            "shortcuts": c("SELECT COUNT(*) FROM shortcuts"),
+        }
+
+
+def export_events(since_ts=0):
+    """Tum event'leri katilimcilariyla export icin doner (JSON/CSV)."""
+    events = get_events(since_ts)
+    for e in events:
+        e["participants"] = [p["name"] for p in get_event_participants(e["id"])]
+    return events
+
+
+def wipe_all():
+    """Tum kisisel/lokal veriyi siler (events, katilimcilar, HR, daily, workouts, kisayollar).
+    meta (seed isaretleri) korunur -> varsayilan kisayollar geri gelmez."""
+    with get_conn() as conn:
+        for t in ("event_participants", "events", "hr_cache", "daily", "workouts", "shortcuts"):
+            conn.execute(f"DELETE FROM {t}")

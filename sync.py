@@ -1,19 +1,22 @@
 """Gunluk sync: (1) gayriresmi dakikalik HR -> hr_cache, (2) resmi API baglam
 (recovery/strain/uyku + workout) -> daily/workouts. pm2 cron / n8n ile tetikle."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import config
 import db
-import whoop_source
+import hr_provider
 
 
 def sync_hr(days=None, debug=False):
+    if not hr_provider.enabled():
+        print("[sync] HR_PROVIDER=none — dakikalik HR atlandi.")
+        return 0
     days = days or config.SYNC_DAYS
-    end = datetime.now(timezone.utc).date()
+    end = datetime.now(UTC).date()
     start = end - timedelta(days=days)
     start_s, end_s = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
     print(f"[sync] HR {start_s} -> {end_s} (7-gun chunk'lar)...")
-    samples = whoop_source.fetch_hr(start_s, end_s, step=60, debug=debug)
+    samples = hr_provider.fetch_hr(start_s, end_s, step=60, debug=debug)
     if not samples:
         print("[sync] UYARI: hic HR ornegi gelmedi. Kimligi ve hr_sample_debug.json'i kontrol et.")
         return 0
