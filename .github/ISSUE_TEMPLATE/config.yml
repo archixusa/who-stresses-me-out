@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security vulnerability
+    url: https://github.com/archixusa/who-stresses-me-out/security/advisories/new
+    about: Please report security issues privately, not as a public issue.
+  - name: 📖 Setup & docs
+    url: https://github.com/archixusa/who-stresses-me-out#-quick-start
+    about: Check the README and docs/ before opening an issue.
