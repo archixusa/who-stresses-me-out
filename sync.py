@@ -35,6 +35,18 @@ def sync_official(days=None):
         return None
 
 
+def sync_auto(days=None):
+    """Otomatik baglam kaynaklari (takvim/Slack) ayarliysa cek; degilse atla."""
+    if not config.AUTO_SOURCES:
+        return None
+    try:
+        import auto_sync
+        return auto_sync.run(days)
+    except Exception as e:  # otomatik kaynak HR/resmi sync'i cokertmesin
+        print(f"[sync] Auto-source sync hatasi (atlaniyor): {e}")
+        return None
+
+
 def run(days=None, debug=False):
     db.init_db()
     try:
@@ -43,7 +55,8 @@ def run(days=None, debug=False):
         print(f"[sync] HR sync atlandi (gayriresmi kaynak kapali olabilir): {e}")
         hr = 0
     official = sync_official(days)
-    return {"hr_samples": hr, "official": official}
+    auto = sync_auto(days)
+    return {"hr_samples": hr, "official": official, "auto": auto}
 
 
 if __name__ == "__main__":

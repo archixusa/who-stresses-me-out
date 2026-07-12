@@ -1,0 +1,9 @@
+# Optional dependencies for automatic context sources (see docs/AUTO_SOURCES_SETUP.md).
+# Install with: pip install -r requirements-auto.txt
+
+# Google Calendar source
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.2.0
+google-auth>=2.30.0
+
+# Slack source uses `requests`, already in requirements.txt

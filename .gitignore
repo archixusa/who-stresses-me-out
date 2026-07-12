@@ -9,3 +9,7 @@ venv/
 hr_sample_debug.json
 whoop_tokens.json
 whoop_token.txt
+google_credentials.json
+google_token.json
+
+assets/_preview.*

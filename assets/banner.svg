@@ -5,50 +5,30 @@
       <stop offset="0.55" stop-color="#0f172a"/>
       <stop offset="1" stop-color="#020617"/>
     </linearGradient>
-    <linearGradient id="ecg" x1="0" y1="0" x2="1200" y2="0" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#34d399"/>
-      <stop offset="0.6" stop-color="#22d3ee"/>
-      <stop offset="1" stop-color="#f43f5e"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop stop-color="#6366f1" stop-opacity="0.35"/>
-      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
-    </radialGradient>
   </defs>
 
-  <rect width="1200" height="400" rx="20" fill="url(#bg)"/>
-  <ellipse cx="980" cy="120" rx="360" ry="240" fill="url(#glow)"/>
+  <rect x="1" y="1" width="1198" height="398" rx="20" fill="url(#bg)"/>
 
-  <!-- dotted grid -->
-  <g fill="#334155" fill-opacity="0.35">
-    <circle cx="60" cy="60" r="2"/><circle cx="110" cy="60" r="2"/><circle cx="160" cy="60" r="2"/>
-    <circle cx="60" cy="110" r="2"/><circle cx="110" cy="110" r="2"/><circle cx="160" cy="110" r="2"/>
-    <circle cx="60" cy="160" r="2"/><circle cx="110" cy="160" r="2"/><circle cx="160" cy="160" r="2"/>
-  </g>
+  <!-- ECG heartbeat, confined to the far-right zone so it never crosses the text -->
+  <path d="M792 210 H845 l10 -9 l10 9 h16 l9 8 l11 -92 l11 104 l9 -20 h16 l12 -14 l12 14 H1000 l10 -9 l10 9 h16 l9 8 l11 -92 l11 104 l9 -20 h16 l12 -14 l12 14 H1160"
+        fill="none" stroke="#22d3ee" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="1056" cy="118" r="11" fill="#f43f5e" fill-opacity="0.25"/>
+  <circle cx="1056" cy="118" r="5" fill="#f43f5e"/>
 
-  <!-- ECG heartbeat line -->
-  <path d="M0 300 H210 l24 -14 l26 -120 l30 210 l24 -150 l22 74 H520 l24 -10 l26 -96 l30 168 l24 -120 l22 58 H1200"
-        fill="none" stroke="url(#ecg)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
-  <circle cx="838" cy="272" r="5" fill="#f43f5e"/>
-
-  <!-- heart glyph -->
-  <path d="M92 250 c-30 -26 -58 -46 -58 -80 c0 -22 17 -36 37 -36 c13 0 22 7 28 16 c6 -9 15 -16 28 -16 c20 0 37 14 37 36 c0 34 -28 54 -58 80 z"
-        transform="translate(-6 -170) scale(1.0)" fill="#f43f5e" opacity="0.95"/>
-
-  <!-- title + tagline -->
-  <text x="60" y="150" fill="#f8fafc" font-size="62" font-weight="800" letter-spacing="-1">who-stresses-me-out</text>
-  <text x="62" y="196" fill="#94a3b8" font-size="24" font-weight="500">Which people and moments actually spike your stress?</text>
-  <text x="62" y="228" fill="#64748b" font-size="18" font-weight="400">Correlate WHOOP recovery &amp; heart-rate data with a one-tap meeting log — on Telegram.</text>
+  <!-- title + tagline (left zone) -->
+  <text x="60" y="150" fill="#f8fafc" font-size="60" font-weight="800" letter-spacing="-1">who-stresses-me-out</text>
+  <text x="62" y="196" fill="#cbd5e1" font-size="23" font-weight="500">Which people and moments spike your stress?</text>
+  <text x="62" y="228" fill="#94a3b8" font-size="17" font-weight="400">Correlate WHOOP heart-rate &amp; recovery with a one-tap meeting log.</text>
 
   <!-- chips -->
   <g font-size="15" font-weight="600">
-    <rect x="62" y="300" width="150" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
-    <text x="137" y="322" fill="#e2e8f0" text-anchor="middle">WHOOP API</text>
-    <rect x="224" y="300" width="150" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
-    <text x="299" y="322" fill="#e2e8f0" text-anchor="middle">Telegram bot</text>
-    <rect x="386" y="300" width="230" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
-    <text x="501" y="322" fill="#e2e8f0" text-anchor="middle">stress ≈ HR over baseline</text>
-    <rect x="628" y="300" width="130" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
-    <text x="693" y="322" fill="#e2e8f0" text-anchor="middle">Python 3.12</text>
+    <rect x="62" y="292" width="150" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
+    <text x="137" y="314" fill="#e2e8f0" text-anchor="middle">WHOOP API</text>
+    <rect x="224" y="292" width="150" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
+    <text x="299" y="314" fill="#e2e8f0" text-anchor="middle">Telegram bot</text>
+    <rect x="386" y="292" width="234" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
+    <text x="503" y="314" fill="#e2e8f0" text-anchor="middle">stress ≈ HR over baseline</text>
+    <rect x="632" y="292" width="128" height="34" rx="17" fill="#0b1220" stroke="#334155"/>
+    <text x="696" y="314" fill="#e2e8f0" text-anchor="middle">Python 3.12</text>
   </g>
 </svg>

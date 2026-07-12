@@ -47,8 +47,11 @@ an analysis engine that turns raw beats-per-minute into a ranked, human-readable
 
 ## ✨ Features
 
-- **One-tap logging** — a persistent Telegram keyboard of `person · context` shortcuts. Tap to
-  start a meeting, tap **⏹ Stop** to end it. No typing required.
+- **Automatic context** *(optional)* — skip logging entirely: pull **who you were with**
+  straight from your **Google Calendar** (real meeting windows + attendees) and **Slack**, and
+  the analysis runs hands-free. See [Automatic context](#-automatic-context-no-manual-logging).
+- **One-tap logging** — or log manually: a persistent Telegram keyboard of `person · context`
+  shortcuts. Tap to start a meeting, tap **⏹ Stop** to end it. No typing required.
 - **Two data sources, graceful fallback**
   - *Official WHOOP API v2* (OAuth2) → daily recovery, HRV, resting HR, strain, sleep + workouts.
   - *Minute-level heart rate* → intra-meeting "spike" resolution (see [caveats](#-data-sources)).
@@ -98,14 +101,18 @@ average.
 
 ```mermaid
 flowchart LR
-  subgraph Log
-    TG["Telegram bot<br/>(shortcuts + commands)"]
+  subgraph Context
+    TG["Telegram bot<br/>(manual, one-tap)"]
+    CAL["Google Calendar<br/>(auto)"]
+    SL["Slack<br/>(auto, experimental)"]
   end
   subgraph WHOOP
     OA["Official API v2<br/>(OAuth2)"]
     UN["Minute HR<br/>(optional)"]
   end
   TG -->|meetings| DB[("SQLite")]
+  CAL -->|meetings + attendees| DB
+  SL -->|DM windows| DB
   OA -->|daily + workouts| DB
   UN -->|minute HR| DB
   DB --> AN["Analysis engine<br/>(stress proxy)"]
@@ -116,12 +123,33 @@ flowchart LR
 | Module | Role |
 | --- | --- |
 | `bot.py` | Telegram logger: shortcut keyboard, `/meet` wizard, data-hygiene commands |
+| `sources/` | Automatic context: `google_calendar`, `slack` → shared `Meeting` shape |
+| `auto_sync.py` | Pulls enabled sources into the events table (de-duplicated) |
 | `whoop_oauth.py` | Official WHOOP API v2 client (OAuth2, token rotation, daily sync) |
 | `whoop_source.py` | Minute-level heart-rate fetch (chunked) |
 | `analyze.py` | Stress-proxy engine (minute-level + day-level) |
 | `report.py` | Renders the HTML report and sends it to Telegram |
 | `db.py` | SQLite layer (events, HR cache, daily context, shortcuts) |
 | `sync.py` | Scheduled sync of all sources |
+
+## 🗓 Automatic context (no manual logging)
+
+Don't want to log anything? Point the tool at your work life and it fills in the *who* for you:
+
+```env
+AUTO_SOURCES=google_calendar,slack
+```
+
+- **Google Calendar** *(strong signal)* — every timed event becomes a meeting: the window is
+  the event's start/end, the person is the other attendee(s), the title is the topic. All-day
+  events, solo blocks, and events you declined are skipped.
+- **Slack** *(experimental, weak signal)* — clusters direct-message activity into "conversation
+  windows". Text chat is a poor proxy for a stress window, so treat it as a hint only.
+
+Everything lands in the same `events` table as manual logs, de-duplicated by `(source, ext_id)`,
+so the stress engine treats calendar meetings, Slack windows, and taps identically. Setup:
+[docs/AUTO_SOURCES_SETUP.md](docs/AUTO_SOURCES_SETUP.md). Adding your own source is one small
+module in `sources/`.
 
 ## 🔌 Data sources
 
@@ -185,6 +213,8 @@ Runs the bot continuously, syncs daily at 05:30, and sends a weekly report Monda
 ```
 who-stresses-me-out/
 ├── bot.py               # Telegram logger + shortcut keyboard
+├── sources/             # Automatic context (google_calendar, slack)
+├── auto_sync.py         # Pull auto-sources into the events table
 ├── whoop_oauth.py       # Official WHOOP API v2 (OAuth2)
 ├── whoop_source.py      # Minute-level HR (optional)
 ├── whoop_token_hr.py    # Token-based HR backfill (optional)

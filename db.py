@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS events (
     topic      TEXT,
     tag        TEXT,
     feeling    INTEGER,
+    source     TEXT DEFAULT 'manual',   -- manual | google_calendar | slack | ...
+    ext_id     TEXT,                     -- kaynak-taraf id (dedup icin)
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shortcuts (
@@ -85,13 +87,22 @@ DEFAULT_SHORTCUTS = [
 def init_db():
     with get_conn() as conn:
         conn.executescript(_SCHEMA)
-        # Migration: eski events tablosuna tag kolonu ekle (idempotent + yaris-guvenli)
+        # Migration: eski events tablosuna eksik kolonlari ekle (idempotent + yaris-guvenli)
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(events)").fetchall()]
-        if "tag" not in cols:
-            try:
-                conn.execute("ALTER TABLE events ADD COLUMN tag TEXT")
-            except sqlite3.OperationalError:
-                pass  # baska surec ayni anda ekledi (duplicate column) — sorun degil
+        for col, ddl in (("tag", "tag TEXT"),
+                         ("source", "source TEXT DEFAULT 'manual'"),
+                         ("ext_id", "ext_id TEXT")):
+            if col not in cols:
+                try:
+                    conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
+                except sqlite3.OperationalError:
+                    pass  # baska surec ayni anda ekledi — sorun degil
+        # ext_id kolonu kesin varken olustur: ayni dis-kaynak olayi iki kez eklenmesin
+        # (manuel olaylarda ext_id NULL -> UNIQUE'e takilmaz)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_ext "
+            "ON events(source, ext_id) WHERE ext_id IS NOT NULL"
+        )
         # Varsayilan kisayollari SADECE bir kez yukle (kullanici hepsini silerse geri gelmesin)
         seeded = conn.execute("SELECT 1 FROM meta WHERE key='shortcuts_seeded'").fetchone()
         if not seeded:
@@ -127,14 +138,38 @@ def list_names(table, limit=12):
 
 # --- events ---
 def add_event(ts_start, friend=None, location=None, topic=None, feeling=None,
-              created_at=None, ts_end=None, tag=None):
+              created_at=None, ts_end=None, tag=None, source="manual", ext_id=None):
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO events(ts_start, ts_end, friend, location, topic, tag, feeling, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (ts_start, ts_end, friend, location, topic, tag, feeling, created_at or ts_start),
+            "INSERT INTO events(ts_start, ts_end, friend, location, topic, tag, feeling, "
+            "source, ext_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts_start, ts_end, friend, location, topic, tag, feeling,
+             source, ext_id, created_at or ts_start),
         )
         return cur.lastrowid
+
+
+def upsert_external_event(source, ext_id, ts_start, ts_end, friend=None, topic=None,
+                          tag=None, created_at=None):
+    """Dis kaynaktan (takvim/Slack) gelen olayi (source, ext_id) ile tekilleştirir:
+    yoksa ekler, varsa zaman/kişi/başlığı gunceller. Doner: 'inserted' | 'updated'.
+    Kullanicinin elle duzenledigi feeling/location'a dokunmaz."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM events WHERE source=? AND ext_id=?", (source, ext_id)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE events SET ts_start=?, ts_end=?, friend=?, topic=?, tag=? WHERE id=?",
+                (ts_start, ts_end, friend, topic, tag, row["id"]),
+            )
+            return "updated"
+        conn.execute(
+            "INSERT INTO events(ts_start, ts_end, friend, topic, tag, source, ext_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ts_start, ts_end, friend, topic, tag, source, ext_id, created_at or ts_start),
+        )
+        return "inserted"
 
 
 # --- shortcuts (hizli butonlar) ---
@@ -187,6 +222,18 @@ def close_latest_open_event(ts_end, max_age_sec):
             return row["id"], "too_old"
         conn.execute("UPDATE events SET ts_end=? WHERE id=?", (ts_end, row["id"]))
         return row["id"], "ok"
+
+
+def delete_external_window(source, ts_from, ts_to):
+    """Bir kaynagin penceredeki dis olaylarini siler (kararsiz sinirli kaynaklarda —
+    or. Slack — her sync'te sil-ve-yeniden-yaz semantigi icin). Doner: silinen sayisi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM events WHERE source=? AND ext_id IS NOT NULL "
+            "AND ts_start >= ? AND ts_start <= ?",
+            (source, ts_from, ts_to),
+        )
+        return cur.rowcount
 
 
 def close_open_events(now, recent_max_sec, default_window_sec):

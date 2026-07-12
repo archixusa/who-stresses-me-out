@@ -26,6 +26,14 @@ WHOOP_CLIENT_SECRET = _get("WHOOP_CLIENT_SECRET")
 WHOOP_REDIRECT_URI = _get("WHOOP_REDIRECT_URI", "http://localhost:8080/callback")
 TOKEN_STORE_PATH = _get("TOKEN_STORE_PATH", "whoop_tokens.json")
 
+# --- Otomatik baglam kaynaklari (takvim / Slack) ---
+AUTO_SOURCES = _get("AUTO_SOURCES", "")   # or. "google_calendar,slack" (bos = kapali)
+GOOGLE_CREDENTIALS_PATH = _get("GOOGLE_CREDENTIALS_PATH", "google_credentials.json")
+GOOGLE_TOKEN_PATH = _get("GOOGLE_TOKEN_PATH", "google_token.json")
+GOOGLE_CALENDAR_ID = _get("GOOGLE_CALENDAR_ID", "primary")
+SLACK_TOKEN = _get("SLACK_TOKEN")
+SLACK_GAP_MIN = int(_get("SLACK_GAP_MIN", "20"))   # bu kadar dk sessizlik yeni konusma sayilir
+
 # --- Zaman dilimi (raporlarda yerel saat) ---
 LOCAL_TZ = _get("LOCAL_TZ", "Europe/Istanbul")
 

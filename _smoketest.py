@@ -191,4 +191,56 @@ assert bot._find_shortcut("Sam · ex") is not None
 assert bot._find_shortcut("yok · yok") is None
 print("bot kisayol yardimcilari: OK")
 
+# --- auto-source: dis kaynak dedup (upsert_external_event) ---
+r1 = db.upsert_external_event("google_calendar", "evt_1", now - 3600, now - 1800,
+                              friend="Colleague", topic="1:1", tag="work")
+assert r1 == "inserted"
+r2 = db.upsert_external_event("google_calendar", "evt_1", now - 3600, now - 1700,
+                              friend="Colleague", topic="1:1 (moved)", tag="work")
+assert r2 == "updated"  # ayni ext_id -> cift eklenmez, guncellenir
+dup = [e for e in db.recent_events(30) if e.get("ext_id") == "evt_1"]
+assert len(dup) == 1 and dup[0]["topic"] == "1:1 (moved)"
+print("upsert_external_event (insert/dedup-update): OK")
+
+# --- google_calendar eslemesi (saf/agsiz) ---
+from sources import google_calendar as gc
+m = gc.event_to_meeting({
+    "id": "g1", "summary": "Sync",
+    "start": {"dateTime": "2026-07-10T14:00:00+03:00"},
+    "end": {"dateTime": "2026-07-10T14:30:00+03:00"},
+    "attendees": [{"self": True, "responseStatus": "accepted"},
+                  {"displayName": "Dana", "email": "dana@x.com", "responseStatus": "accepted"}],
+})
+assert m and m.person == "Dana" and m.title == "Sync" and m.tag == "work"
+assert m.ts_end - m.ts_start == 1800
+assert gc.event_to_meeting({"id": "g2", "start": {"date": "2026-07-10"},
+                            "end": {"date": "2026-07-11"}}) is None  # tum-gun
+assert gc.event_to_meeting({"id": "g3",
+    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T09:15:00Z"},
+    "attendees": [{"self": True}]}) is None  # tek kisilik
+assert gc.event_to_meeting({"id": "g4",
+    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T10:00:00Z"},
+    "attendees": [{"self": True, "responseStatus": "declined"}, {"displayName": "X"}]}) is None  # reddedilmis
+print("google_calendar.event_to_meeting (map/skip): OK")
+
+# --- slack kumeleme (saf) ---
+from sources import slack
+cl = slack.cluster([100, 130, 160, 100000, 100050], 60)
+assert len(cl) == 2 and cl[0][2] == 3 and cl[1][2] == 2
+print("slack.cluster: OK")
+
+# --- delete_external_window (replace-window semantigi) ---
+db.upsert_external_event("slack", "C:1", now - 100, now - 50, friend="X")
+db.upsert_external_event("slack", "C:2", now - 40, now - 10, friend="X")
+assert db.delete_external_window("slack", now - 1000, now) == 2
+assert not [e for e in db.recent_events(40) if e.get("source") == "slack"]
+assert db.delete_external_window("slack", now - 1000, now) == 0  # bos pencere
+print("delete_external_window (replace-window): OK")
+
+# id'siz calendar event -> None (dedup korumasi)
+assert gc.event_to_meeting({
+    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T10:00:00Z"},
+    "attendees": [{"self": True}, {"displayName": "Y"}]}) is None
+print("event_to_meeting id-guard: OK")
+
 print("\n✅ TUM KONTROLLER GECTI")
