@@ -13,3 +13,8 @@ google_credentials.json
 google_token.json
 
 assets/_preview.*
+wsmo_export_*.json
+wsmo_export_*.csv
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

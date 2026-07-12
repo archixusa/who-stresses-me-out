@@ -1,15 +1,15 @@
-"""Telegram logger bot (v2): bulusmalari hizli logla; HR eslestirme sync/analyze'de.
+"""Telegram bot — button-first UI for logging *who you were with*, so the analysis can
+correlate it with your own WHOOP data. No WHOOP credentials needed here; it only writes
+to local SQLite. Only config.TELEGRAM_CHAT_ID may interact.
 
-Whoop kimligi GEREKMEZ; bot sadece SQLite'a yazar.
-Guvenlik: sadece config.TELEGRAM_CHAT_ID etkilesebilir.
-
-v2 duzeltmeleri: his adiminda kayit KAYBI onlendi (event konu adiminda kaydedilir,
-his sonradan islenir), HTML escaping (Markdown cokmesi giderildi), pattern'li
-callback'ler (yanlis veri/int crash yok), timeout + yeniden giris, hata handler'i,
-non-blocking /rapor, /son /sil /gun veri hijyeni komutlari, yerel saat gosterimi.
+Product rules enforced in the UI:
+  * NO mood / feeling / tension / survey input anywhere.
+  * Participants are never messaged; the app only uses the owner's own local data.
+  * Aliases are encouraged for person names.
 """
 import asyncio
 import html
+import json
 import logging
 import time
 
@@ -25,21 +25,23 @@ from telegram.ext import (
 
 import config
 import db
+import export as export_mod
 import report as report_mod
 import tzutil
 
-SEP = " · "                 # kisayol etiketinde kisi-baglam ayraci
-BITIR_LABEL = "⏹ Bitir"
+SEP = " · "
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO
-)
-log = logging.getLogger("whoop-bot")
+# Persistent main-menu labels
+M_NEW, M_STOP, M_REPORTS = "➕ New meeting", "⏹ Stop", "📊 Reports"
+M_TODAY, M_RECENT, M_SETTINGS = "📅 Today", "🕘 Recent", "⚙️ Settings"
+MENU_LABELS = {M_NEW, M_STOP, M_REPORTS, M_TODAY, M_RECENT, M_SETTINGS}
 
-FRIEND, LOCATION, TOPIC, FEELING = range(4)
-CONV_TIMEOUT = 600  # sn: yarim kalan /meet bu surede kapanir
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
+log = logging.getLogger("wsmo-bot")
 
-_rid_seq = 0  # her klavye render'ina benzersiz kimlik (eski klavye taplarini reddetmek icin)
+FRIEND, LOCATION, TOPIC = range(3)
+CONV_TIMEOUT = 600
+_rid_seq = 0
 
 
 def _next_rid():
@@ -57,311 +59,19 @@ def _auth(update: Update) -> bool:
     return bool(chat) and str(chat.id) == str(config.TELEGRAM_CHAT_ID)
 
 
-def _render_kb(ctx, ns, names, with_new=True):
-    """Klavyeyi benzersiz render-id ile olusturur; index'i o render'in snapshot'ina baglar."""
-    rid = _next_rid()
-    ctx.user_data[f"{ns}_rid"] = rid
-    ctx.user_data[f"snap_{rid}"] = names
-    rows = [[InlineKeyboardButton(n, callback_data=f"{ns}:{rid}:i:{i}")]
-            for i, n in enumerate(names)]
-    tail = []
-    if with_new:
-        tail.append(InlineKeyboardButton("➕ Yeni", callback_data=f"{ns}:{rid}:new"))
-    tail.append(InlineKeyboardButton("⏭ Atla", callback_data=f"{ns}:{rid}:skip"))
-    rows.append(tail)
-    return InlineKeyboardMarkup(rows)
-
-
-async def _send_html(target, text):
-    """HTML gonder; parse patlarsa duz metne dus."""
+async def _send_html(target, text, **kw):
     try:
-        await target.reply_text(text, parse_mode=ParseMode.HTML)
+        return await target.reply_text(text, parse_mode=ParseMode.HTML, **kw)
     except Exception as e:
-        log.warning("HTML gonderim hatasi, duz metne dusuluyor: %s", e)
-        plain = html.unescape(
-            text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
-        )
-        await target.reply_text(plain)
+        log.warning("HTML send failed, falling back to plain: %s", e)
+        plain = html.unescape(text.replace("<b>", "").replace("</b>", "")
+                              .replace("<i>", "").replace("</i>", ""))
+        return await target.reply_text(plain, **kw)
 
 
-# ---------------- guided /meet ----------------
-async def meet_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return ConversationHandler.END
-    ctx.user_data.clear()
-    ctx.user_data["ts_start"] = _now()
-    kb = _render_kb(ctx, "fr", db.list_names("friends"))
-    await update.message.reply_text("🤝 Kiminle bulustun?", reply_markup=kb)
-    return FRIEND
-
-
-def _resolve(ctx, ns, data):
-    """callback_data 'ns:rid:kind[:idx]' -> ('pick'|'new'|'skip'|'expired', name)."""
-    parts = data.split(":")
-    if len(parts) < 3:
-        return "expired", None
-    rid = int(parts[1])
-    if rid != ctx.user_data.get(f"{ns}_rid"):  # eski klavye tapi -> reddet
-        return "expired", None
-    kind = parts[2]
-    if kind == "new":
-        return "new", None
-    if kind == "skip":
-        return "skip", None
-    if kind == "i":
-        idx = int(parts[3])
-        names = ctx.user_data.get(f"snap_{rid}", [])
-        return "pick", (names[idx] if 0 <= idx < len(names) else None)
-    return "expired", None
-
-
-async def friend_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    action, name = _resolve(ctx, "fr", q.data)
-    if action == "expired":
-        await q.answer("Bu klavye eskidi — /meet ile tekrar basla.", show_alert=True)
-        return FRIEND
-    await q.answer()
-    if action == "new":
-        await q.edit_message_text("✍️ Kisi adini yaz:")
-        return FRIEND
-    if action == "pick":
-        ctx.user_data["friend"] = name
-    await q.edit_message_text(f"👤 {ctx.user_data.get('friend') or '—'}")
-    return await _ask_location(q.message, ctx)
-
-
-async def friend_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _intercept_control(update, ctx):
-        return ConversationHandler.END
-    name = update.message.text.strip()
-    ctx.user_data["friend"] = name
-    db.add_name("friends", name)
-    return await _ask_location(update.message, ctx)
-
-
-async def _ask_location(message, ctx):
-    kb = _render_kb(ctx, "lo", db.list_names("locations"))
-    await message.reply_text("📍 Nerede?", reply_markup=kb)
-    return LOCATION
-
-
-async def location_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    action, name = _resolve(ctx, "lo", q.data)
-    if action == "expired":
-        await q.answer("Bu klavye eskidi — /meet ile tekrar basla.", show_alert=True)
-        return LOCATION
-    await q.answer()
-    if action == "new":
-        await q.edit_message_text("✍️ Yer adini yaz:")
-        return LOCATION
-    if action == "pick":
-        ctx.user_data["location"] = name
-    await q.edit_message_text(f"📍 {ctx.user_data.get('location') or '—'}")
-    await q.message.reply_text("💬 Ne konustunuz? (kisa not, /atla ile gec)")
-    return TOPIC
-
-
-async def location_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _intercept_control(update, ctx):
-        return ConversationHandler.END
-    name = update.message.text.strip()
-    ctx.user_data["location"] = name
-    db.add_name("locations", name)
-    await update.message.reply_text("💬 Ne konustunuz? (kisa not, /atla ile gec)")
-    return TOPIC
-
-
-async def topic_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _intercept_control(update, ctx):
-        return ConversationHandler.END
-    ctx.user_data["topic"] = update.message.text.strip()
-    return await _save_and_ask_feeling(update.message, ctx)
-
-
-async def topic_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    return await _save_and_ask_feeling(update.message, ctx)
-
-
-async def _save_and_ask_feeling(message, ctx):
-    """Event'i BURADA kaydet (his gelmese bile kayip olmasin), sonra his sor.
-    Idempotent: prompt gonderimi patlar da kullanici tekrar denerse ikinci kayit acilmaz."""
-    d = ctx.user_data
-    if ctx.user_data.get("event_id"):
-        db.set_event_topic(ctx.user_data["event_id"], d.get("topic"))  # retry: mevcut kaydi guncelle
-    else:
-        ctx.user_data["event_id"] = db.add_event(
-            ts_start=d["ts_start"], friend=d.get("friend"), location=d.get("location"),
-            topic=d.get("topic"), feeling=None, created_at=_now(),
-        )
-    rows = [[InlineKeyboardButton(str(i), callback_data=f"fe:{i}") for i in range(1, 6)],
-            [InlineKeyboardButton("⏭ Atla", callback_data="fe:skip")]]
-    await message.reply_text(
-        "😌 Nasil hissettin? (1=cok rahat … 5=cok gergin)",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-    return FEELING
-
-
-async def feeling_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    feeling = None if q.data == "fe:skip" else int(q.data.split(":")[1])
-    _finish_feeling(ctx, feeling)
-    await q.edit_message_text(_summary(ctx.user_data, feeling))
-    return ConversationHandler.END
-
-
-async def feeling_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _intercept_control(update, ctx):
-        return ConversationHandler.END
-    t = update.message.text.strip()
-    if t not in ("1", "2", "3", "4", "5"):
-        await update.message.reply_text("1-5 arasi bir rakam yaz ya da butona bas (⏭ Atla).")
-        return FEELING
-    _finish_feeling(ctx, int(t))
-    await update.message.reply_text(_summary(ctx.user_data, int(t)))
-    return ConversationHandler.END
-
-
-def _finish_feeling(ctx, feeling):
-    if feeling is not None and ctx.user_data.get("event_id"):
-        db.set_event_feeling(ctx.user_data["event_id"], feeling)
-
-
-def _summary(d, feeling):
-    when = tzutil.fmt(d["ts_start"])
-    return (f"✅ Loglandi ({when})\n"
-            f"👤 {d.get('friend') or '—'}  📍 {d.get('location') or '—'}\n"
-            f"💬 {d.get('topic') or '—'}  😌 {feeling if feeling is not None else '—'}\n\n"
-            f"Bittiginde /bitir yaz (yoksa {config.DEFAULT_WINDOW_MIN}dk pencere sayilir).")
-
-
-async def conv_timeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if ctx.user_data.get("event_id"):
-        return ConversationHandler.END  # zaten kaydedildi
-    if update and update.effective_message:
-        await update.effective_message.reply_text("⏱ Zaman asimi — /meet ile tekrar basla.")
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return ConversationHandler.END
-    await update.message.reply_text("İptal.")
-    return ConversationHandler.END
-
-
-# ---------------- quick + utility commands ----------------
-async def quick_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    raw = update.message.text.partition(" ")[2].strip()
-    if not raw:
-        await update.message.reply_text("Kullanim: /log Kisi | Yer | Konu")
-        return
-    parts = [p.strip() or None for p in raw.split("|")]
-    friend = parts[0] if len(parts) > 0 else None
-    location = parts[1] if len(parts) > 1 else None
-    topic = parts[2] if len(parts) > 2 else None
-    if friend:
-        db.add_name("friends", friend)
-    if location:
-        db.add_name("locations", location)
-    db.add_event(ts_start=_now(), friend=friend, location=location, topic=topic, created_at=_now())
-    await update.message.reply_text(
-        f"✅ {friend or '—'} · {location or '—'} · {topic or '—'}\n/bitir ile kapat."
-    )
-
-
-async def bitir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    eid, status = db.close_latest_open_event(_now(), config.MAX_WINDOW_MIN * 60)
-    if status == "no_open":
-        await update.message.reply_text("Acik bulusma yok.")
-    elif status == "too_old":
-        await update.message.reply_text(
-            f"⚠ En son acik bulusma cok eski (#{eid}); otomatik kapatmadim. "
-            f"Gecmisse /sil {eid} ile silebilirsin."
-        )
-    else:
-        await update.message.reply_text("⏹ Bulusma kapatildi.")
-
-
-async def son(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    evs = db.recent_events(10)
-    if not evs:
-        await update.message.reply_text("Kayit yok.")
-        return
-    lines = ["🗒 <b>Son kayitlar:</b>"]
-    for e in evs:
-        when = tzutil.fmt(e["ts_start"])
-        open_mark = " ⏺acik" if e["ts_end"] is None else ""
-        lines.append(f"#{e['id']} {when} · {html.escape(e['friend'] or '—')} · "
-                     f"{html.escape(e['location'] or '—')}{open_mark}")
-    lines.append("\nSilmek: /sil <id>")
-    await _send_html(update.message, "\n".join(lines))
-
-
-async def sil(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    arg = update.message.text.partition(" ")[2].strip()
-    if not arg.isdigit():
-        await update.message.reply_text("Kullanim: /sil <id>  (id'leri /son ile gor)")
-        return
-    ok = db.delete_event(int(arg))
-    await update.message.reply_text(f"🗑 #{arg} silindi." if ok else f"#{arg} bulunamadi.")
-
-
-async def gun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    day = tzutil.fmt(_now(), "%Y-%m-%d")
-    d = db.get_daily(day)
-    if not d:
-        await update.message.reply_text(
-            f"{day} icin resmi Whoop verisi yok (OAuth bagli mi? sync calisti mi?)."
-        )
-        return
-    await update.message.reply_text(
-        f"📅 {day}\n"
-        f"Recovery: {d.get('recovery') or '—'}%  ·  HRV: {d.get('hrv') or '—'} ms\n"
-        f"Dinlenme nabzi: {d.get('rhr') or '—'}  ·  Gun strain: {d.get('strain') or '—'}\n"
-        f"Uyku performansi: {d.get('sleep_perf') or '—'}%"
-    )
-
-
-async def rapor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    await update.message.reply_text("Hesaplaniyor…")
-    text = await asyncio.to_thread(report_mod.build_report, 7)  # event loop'u bloklamasin
-    await _send_html(update.message, text)
-
-
-# ---------------- hizli kisayol klavyesi ----------------
+# ---------------- persistent menu + shortcuts ----------------
 def _label(sc):
     return f"{sc['friend']}{SEP}{sc['tag']}"
-
-
-def _main_keyboard():
-    """Kalici alt-klavye: kisayollar (2'li satir) + son satirda ⏹ Bitir."""
-    labels = [_label(s) for s in db.list_shortcuts()]
-    rows, row = [], []
-    for lbl in labels:
-        row.append(KeyboardButton(lbl))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([KeyboardButton(BITIR_LABEL)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
 def _find_shortcut(text):
@@ -371,126 +81,638 @@ def _find_shortcut(text):
     return None
 
 
-async def shortcut_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Kalici klavyeden gelen metinler: kisayol -> hizli logla; ⏹ Bitir -> kapat."""
+def _main_keyboard():
+    rows = [[KeyboardButton(M_NEW), KeyboardButton(M_STOP)]]
+    labels = [_label(s) for s in db.list_shortcuts()]
+    row = []
+    for lbl in labels:
+        row.append(KeyboardButton(lbl))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(M_REPORTS), KeyboardButton(M_TODAY)])
+    rows.append([KeyboardButton(M_RECENT), KeyboardButton(M_SETTINGS)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+# ---------------- live meeting card ----------------
+def _card_text(event_id):
+    ev = next((e for e in db.recent_events(50) if e["id"] == event_id), None)
+    if not ev:
+        return "Meeting not found."
+    parts = db.participant_names(ev) or ["—"]
+    started = tzutil.fmt(ev["ts_start"], "%H:%M")
+    elapsed = max(0, (_now() - ev["ts_start"]) // 60)
+    conf = [k for k in ("alcohol", "illness", "commute") if ev.get(k)]
+    if ev.get("caffeine") in ("low", "high"):
+        conf.append(f"caffeine:{ev['caffeine']}")
+    lines = [
+        "🟢 <b>Meeting in progress</b>",
+        f"👥 {html.escape(', '.join(parts))}",
+        f"🏷 {html.escape(ev.get('tag') or '—')}   📍 {html.escape(ev.get('location') or '—')}",
+        f"🕒 started {started} · {elapsed} min",
+    ]
+    if ev.get("topic"):
+        lines.append(f"💬 {html.escape(ev['topic'])}")
+    if ev.get("notes"):
+        lines.append(f"📝 {html.escape(ev['notes'])}")
+    if conf:
+        lines.append(f"⚙️ {html.escape(', '.join(conf))}")
+    return "\n".join(lines)
+
+
+def _card_kb(event_id):
+    e = str(event_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Add participant", callback_data=f"card:{e}:addp"),
+         InlineKeyboardButton("📝 Note", callback_data=f"card:{e}:note")],
+        [InlineKeyboardButton("⚙️ Extra context", callback_data=f"card:{e}:xc")],
+        [InlineKeyboardButton("⏹ Stop", callback_data=f"card:{e}:stop"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"card:{e}:cancel")],
+    ])
+
+
+async def _open_card(message, ctx, event_id):
+    sent = await _send_html(message, _card_text(event_id), reply_markup=_card_kb(event_id))
+    ctx.chat_data["card"] = {"event_id": event_id, "msg_id": sent.message_id if sent else None}
+
+
+async def _refresh_card(ctx, event_id):
+    card = ctx.chat_data.get("card")
+    if not card or card.get("event_id") != event_id or not card.get("msg_id"):
+        return
+    try:
+        await ctx.bot.edit_message_text(
+            _card_text(event_id), chat_id=config.TELEGRAM_CHAT_ID, message_id=card["msg_id"],
+            parse_mode=ParseMode.HTML, reply_markup=_card_kb(event_id))
+    except Exception:
+        pass
+
+
+def _start_meeting(participants=None, friend=None, location=None, topic=None, tag=None):
+    """Close any open meeting, open a new one, return its id."""
+    db.close_open_events(_now(), config.MAX_WINDOW_MIN * 60, config.DEFAULT_WINDOW_MIN * 60)
+    return db.add_event(ts_start=_now(), participants=participants, friend=friend,
+                        location=location, topic=topic, tag=tag, created_at=_now())
+
+
+# ---------------- card callbacks ----------------
+_XC = {"caf0": ("caffeine", "none"), "caf1": ("caffeine", "low"), "caf2": ("caffeine", "high"),
+       "alc": ("alcohol", 1), "ill": ("illness", 1), "com": ("commute", 1)}
+
+
+def _xc_kb(event_id):
+    e = str(event_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("☕ Caffeine: none", callback_data=f"xc:{e}:caf0"),
+         InlineKeyboardButton("low", callback_data=f"xc:{e}:caf1"),
+         InlineKeyboardButton("high", callback_data=f"xc:{e}:caf2")],
+        [InlineKeyboardButton("🍷 Alcohol", callback_data=f"xc:{e}:alc"),
+         InlineKeyboardButton("🤒 Illness", callback_data=f"xc:{e}:ill"),
+         InlineKeyboardButton("🚶 Commute", callback_data=f"xc:{e}:com")],
+        [InlineKeyboardButton("✅ Done", callback_data=f"xc:{e}:done")],
+    ])
+
+
+async def card_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    _, eid, action = q.data.split(":")
+    eid = int(eid)
+    await q.answer()
+    if action == "stop":
+        db.close_latest_open_event(_now(), config.MAX_WINDOW_MIN * 60)
+        await q.edit_message_text(_card_text(eid).replace("🟢 <b>Meeting in progress</b>",
+                                                          "⏹ <b>Meeting ended</b>"),
+                                  parse_mode=ParseMode.HTML)
+        ctx.chat_data.pop("card", None)
+    elif action == "cancel":
+        db.delete_event(eid)
+        await q.edit_message_text("❌ Meeting canceled and removed.")
+        ctx.chat_data.pop("card", None)
+    elif action == "addp":
+        ctx.chat_data["await"] = ("participant", eid)
+        await q.message.reply_text("✍️ Type the participant name (or alias):")
+    elif action == "note":
+        ctx.chat_data["await"] = ("note", eid)
+        await q.message.reply_text("✍️ Type a short note:")
+    elif action == "xc":
+        await q.message.reply_text("⚙️ Extra context (optional — no mood questions):",
+                                   reply_markup=_xc_kb(eid))
+
+
+async def xc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    _, eid, key = q.data.split(":")
+    eid = int(eid)
+    await q.answer()
+    if key == "done":
+        await q.edit_message_text("✅ Extra context saved.")
+        await _refresh_card(ctx, eid)
+        return
+    col, val = _XC[key]
+    if col in ("alcohol", "illness", "commute"):  # toggle
+        cur = next((e.get(col) for e in db.recent_events(50) if e["id"] == eid), 0)
+        val = 0 if cur else 1
+    db.set_event_confounders(eid, **{col: val})
+    await q.answer(f"{col} set", show_alert=False)
+
+
+# ---------------- text dispatcher (menu + shortcuts + awaited input) ----------------
+async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _auth(update):
         return
     text = (update.message.text or "").strip()
 
-    if text == BITIR_LABEL:
-        eid, status = db.close_latest_open_event(_now(), config.MAX_WINDOW_MIN * 60)
-        msg = {"no_open": "Acik bulusma yok.",
-               "too_old": f"⚠ Son acik bulusma cok eski (#{eid}); /sil {eid} ile silebilirsin.",
-               "ok": "⏹ Bulusma kapatildi."}[status]
-        await update.message.reply_text(msg)
+    awaiting = ctx.chat_data.get("await")
+    if awaiting:
+        kind, eid = awaiting
+        ctx.chat_data.pop("await", None)
+        if kind == "participant":
+            db.add_participant(eid, text)
+            db.add_name("friends", text)
+        elif kind == "note":
+            db.set_event_confounders(eid, notes=text)
+        await _refresh_card(ctx, eid)
+        await update.message.reply_text("✅ Updated.")
         return
+
+    if text == M_NEW:
+        return await _new_meeting_prompt(update, ctx)
+    if text == M_STOP:
+        return await _stop(update)
+    if text == M_REPORTS:
+        return await reports_menu(update, ctx)
+    if text == M_TODAY:
+        return await today(update, ctx)
+    if text == M_RECENT:
+        return await recent(update, ctx)
+    if text == M_SETTINGS:
+        return await settings(update, ctx)
 
     sc = _find_shortcut(text)
     if sc:
-        # onceki TUM acik bulusmalari kapat (orphan birikmesin), yenisini ac
-        db.close_open_events(_now(), config.MAX_WINDOW_MIN * 60, config.DEFAULT_WINDOW_MIN * 60)
-        db.add_event(ts_start=_now(), friend=sc["friend"], tag=sc["tag"], created_at=_now())
-        await update.message.reply_text(f"✅ {text} basladi · bitince ⏹ Bitir")
+        eid = _start_meeting(participants=[sc["friend"]], tag=sc["tag"])
+        await _open_card(update.message, ctx, eid)
         return
 
-    # taninmayan metin -> kisa ipucu (nadiren, klavye disi yazarsa)
+    await update.message.reply_text("Tap a button below, or use /meet · /log · /help.")
+
+
+async def _new_meeting_prompt(update, ctx):
     await update.message.reply_text(
-        "Bir kisayola bas, ya da /log Kisi | Yer | Konu · /meet · /kisayollar"
-    )
+        "Start a meeting: tap a shortcut below, or use <b>/meet</b> for the step-by-step "
+        "flow (person → context → optional note).", parse_mode=ParseMode.HTML)
 
 
-async def _intercept_control(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/meet konusmasi sirasinda kalici klavyeden kisayol/⏹ Bitir gelirse konusmayi
-    bitirip hizli-log mantigina yonlendir (label'in friend/topic olarak kaydini onler).
-    True donerse cagiran handler ConversationHandler.END dondurmeli."""
+async def _stop(update):
+    eid, status = db.close_latest_open_event(_now(), config.MAX_WINDOW_MIN * 60)
+    msg = {"no_open": "No meeting in progress.",
+           "too_old": f"⚠ The last open meeting is very old (#{eid}); I didn't auto-close it. "
+                      f"Use /delete {eid} if it was a leftover.",
+           "ok": "⏹ Meeting ended."}[status]
+    await update.message.reply_text(msg)
+
+
+# ---------------- /meet step-by-step (no feeling) ----------------
+def _render_kb(ctx, ns, names):
+    rid = _next_rid()
+    ctx.user_data[f"{ns}_rid"] = rid
+    ctx.user_data[f"snap_{rid}"] = names
+    rows = [[InlineKeyboardButton(n, callback_data=f"{ns}:{rid}:i:{i}")] for i, n in enumerate(names)]
+    rows.append([InlineKeyboardButton("➕ New", callback_data=f"{ns}:{rid}:new"),
+                 InlineKeyboardButton("⏭ Skip", callback_data=f"{ns}:{rid}:skip")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _resolve(ctx, ns, data):
+    parts = data.split(":")
+    if len(parts) < 3:
+        return "expired", None
+    if int(parts[1]) != ctx.user_data.get(f"{ns}_rid"):
+        return "expired", None
+    kind = parts[2]
+    if kind in ("new", "skip"):
+        return kind, None
+    names = ctx.user_data.get(f"snap_{parts[1]}", [])
+    idx = int(parts[3])
+    return "pick", (names[idx] if 0 <= idx < len(names) else None)
+
+
+async def meet_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update):
+        return ConversationHandler.END
+    ctx.user_data.clear()
+    ctx.user_data["ts_start"] = _now()
+    await update.message.reply_text("🤝 Who were you with?",
+                                    reply_markup=_render_kb(ctx, "fr", db.list_names("friends")))
+    return FRIEND
+
+
+async def friend_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    action, name = _resolve(ctx, "fr", q.data)
+    if action == "expired":
+        await q.answer("This keyboard expired — start again with /meet.", show_alert=True)
+        return FRIEND
+    await q.answer()
+    if action == "new":
+        await q.edit_message_text("✍️ Type the person's name or alias:")
+        return FRIEND
+    if action == "pick":
+        ctx.user_data["friend"] = name
+    await q.edit_message_text(f"👤 {ctx.user_data.get('friend') or '—'}")
+    return await _ask_location(q.message, ctx)
+
+
+async def friend_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _intercept(update, ctx):
+        return ConversationHandler.END
+    ctx.user_data["friend"] = update.message.text.strip()
+    db.add_name("friends", ctx.user_data["friend"])
+    return await _ask_location(update.message, ctx)
+
+
+async def _ask_location(message, ctx):
+    await message.reply_text("📍 Where?", reply_markup=_render_kb(ctx, "lo", db.list_names("locations")))
+    return LOCATION
+
+
+async def location_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    action, name = _resolve(ctx, "lo", q.data)
+    if action == "expired":
+        await q.answer("This keyboard expired — start again with /meet.", show_alert=True)
+        return LOCATION
+    await q.answer()
+    if action == "new":
+        await q.edit_message_text("✍️ Type the place:")
+        return LOCATION
+    if action == "pick":
+        ctx.user_data["location"] = name
+    await q.edit_message_text(f"📍 {ctx.user_data.get('location') or '—'}")
+    await q.message.reply_text("🏷 Context/topic? (short, or /skip)")
+    return TOPIC
+
+
+async def location_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _intercept(update, ctx):
+        return ConversationHandler.END
+    ctx.user_data["location"] = update.message.text.strip()
+    db.add_name("locations", ctx.user_data["location"])
+    await update.message.reply_text("🏷 Context/topic? (short, or /skip)")
+    return TOPIC
+
+
+async def topic_txt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if await _intercept(update, ctx):
+        return ConversationHandler.END
+    ctx.user_data["tag"] = update.message.text.strip()
+    return await _finish_meet(update.message, ctx)
+
+
+async def topic_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    return await _finish_meet(update.message, ctx)
+
+
+async def _finish_meet(message, ctx):
+    d = ctx.user_data
+    if not d.get("event_id"):
+        d["event_id"] = _start_meeting(friend=d.get("friend"), location=d.get("location"),
+                                       tag=d.get("tag"))
+    await _open_card(message, ctx, d["event_id"])
+    return ConversationHandler.END
+
+
+async def conv_timeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update and update.effective_message and not ctx.user_data.get("event_id"):
+        await update.effective_message.reply_text("⏱ Timed out — start again with /meet.")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if _auth(update):
+        await update.message.reply_text("Canceled.")
+    return ConversationHandler.END
+
+
+async def _intercept(update, ctx):
+    """If a menu/shortcut button is tapped mid-/meet, end the conversation and route it."""
     text = (update.message.text or "").strip()
-    if text == BITIR_LABEL or _find_shortcut(text):
-        await shortcut_tap(update, ctx)
+    if text in MENU_LABELS or _find_shortcut(text):
+        await text_router(update, ctx)
         return True
     return False
 
 
-async def klavye(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _auth(update):
-        return
-    await update.message.reply_text("⌨️ Kisayol klavyesi acildi.", reply_markup=_main_keyboard())
+# ---------------- reports / today / recent / settings ----------------
+async def reports_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Last 7 days", callback_data="rep:7"),
+         InlineKeyboardButton("Last 30 days", callback_data="rep:30")],
+        [InlineKeyboardButton("⬇️ Export CSV", callback_data="rep:csv"),
+         InlineKeyboardButton("⬇️ Export JSON", callback_data="rep:json")],
+    ])
+    await update.message.reply_text("📊 Reports", reply_markup=kb)
 
 
-async def kisayollar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def report_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    _, arg = q.data.split(":")
+    await q.answer()
+    if arg in ("7", "30"):
+        await q.message.reply_text("Calculating…")
+        text = await asyncio.to_thread(report_mod.build_report, int(arg))
+        await _send_html(q.message, text)
+    else:
+        await _do_export(q.message, arg)
+
+
+async def today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    day = tzutil.fmt(_now(), "%Y-%m-%d")
+    d = db.get_daily(day)
+    if not d:
+        await update.message.reply_text(
+            f"No official WHOOP data for {day} yet (OAuth connected? sync run?).")
+        return
+    await update.message.reply_text(
+        f"📅 {day}\nRecovery {d.get('recovery') or '—'}% · HRV {d.get('hrv') or '—'}ms\n"
+        f"Resting HR {d.get('rhr') or '—'} · Day strain {d.get('strain') or '—'}\n"
+        f"Sleep performance {d.get('sleep_perf') or '—'}%")
+
+
+def _recent_kb(evs, page):
+    rows = []
+    for e in evs:
+        rows.append([InlineKeyboardButton(f"🗑 #{e['id']}", callback_data=f"rec:del:{e['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rec:pg:{page-1}"))
+    nav.append(InlineKeyboardButton("↻", callback_data=f"rec:pg:{page}"))
+    if len(evs) == 5:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"rec:pg:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+def _recent_text(evs, page):
+    if not evs:
+        return "No records."
+    lines = [f"🕘 <b>Recent</b> (page {page + 1})"]
+    for e in evs:
+        parts = ", ".join(db.participant_names(e)) or "—"
+        mark = " ⏺open" if e["ts_end"] is None else ""
+        lines.append(f"#{e['id']} {tzutil.fmt(e['ts_start'])} · {html.escape(parts)} · "
+                     f"{html.escape(e.get('tag') or '—')}{mark}")
+    return "\n".join(lines)
+
+
+def _recent_page(page):
+    with db.get_conn() as c:
+        rows = c.execute("SELECT * FROM events ORDER BY ts_start DESC LIMIT 5 OFFSET ?",
+                         (page * 5,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    evs = _recent_page(0)
+    await _send_html(update.message, _recent_text(evs, 0), reply_markup=_recent_kb(evs, 0))
+
+
+async def recent_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    parts = q.data.split(":")
+    await q.answer()
+    if parts[1] == "pg":
+        page = int(parts[2])
+        evs = _recent_page(page)
+        await q.edit_message_text(_recent_text(evs, page), parse_mode=ParseMode.HTML,
+                                  reply_markup=_recent_kb(evs, page))
+    elif parts[1] == "del":  # step 1: confirm
+        eid, page = int(parts[2]), int(parts[3])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Delete", callback_data=f"rec:yes:{eid}:{page}"),
+            InlineKeyboardButton("↩ Keep", callback_data=f"rec:pg:{page}")]])
+        await q.edit_message_text(f"Delete record #{eid}? This can be undone briefly.",
+                                  reply_markup=kb)
+    elif parts[1] == "yes":  # step 2: delete + offer undo
+        eid, page = int(parts[2]), int(parts[3])
+        ev = next((e for e in db.recent_events(200) if e["id"] == eid), None)
+        if ev:
+            ev["participants"] = db.participant_names(ev)
+            ctx.chat_data["undo"] = ev
+        db.delete_event(eid)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩ Undo", callback_data=f"rec:undo:{eid}:{page}")]])
+        await q.edit_message_text(f"🗑 Deleted #{eid}.", reply_markup=kb)
+    elif parts[1] == "undo":
+        ev = ctx.chat_data.pop("undo", None)
+        if ev:
+            db.add_event(ts_start=ev["ts_start"], ts_end=ev["ts_end"],
+                         participants=ev.get("participants"), location=ev.get("location"),
+                         topic=ev.get("topic"), tag=ev.get("tag"), created_at=ev.get("created_at"),
+                         caffeine=ev.get("caffeine"), alcohol=ev.get("alcohol"),
+                         illness=ev.get("illness"), commute=ev.get("commute"), notes=ev.get("notes"))
+            await q.edit_message_text("↩ Restored.")
+        else:
+            await q.edit_message_text("Nothing to undo.")
+
+
+async def settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = db.data_summary()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Shortcuts", callback_data="set:sc"),
+         InlineKeyboardButton("⬇️ Export", callback_data="set:exp")],
+        [InlineKeyboardButton("🗑 Delete all data", callback_data="set:wipe")],
+    ])
+    await _send_html(update.message,
+                     f"⚙️ <b>Settings</b>\nTimezone: {config.LOCAL_TZ}\n"
+                     f"Events: {s['events']} · HR samples: {s['hr_samples']} · "
+                     f"Official days: {s['daily_days']}\n"
+                     f"Aliases are encouraged for person names — your data stays local.",
+                     reply_markup=kb)
+
+
+async def settings_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    _, arg = q.data.split(":")
+    await q.answer()
+    if arg == "sc":
+        await shortcuts_cmd(update, ctx, q.message)
+    elif arg == "exp":
+        await _do_export(q.message, "json")
+    elif arg == "wipe":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ Yes, delete everything", callback_data="wipe:yes"),
+            InlineKeyboardButton("Cancel", callback_data="wipe:no")]])
+        await q.message.reply_text("This permanently deletes ALL local data. Continue?",
+                                   reply_markup=kb)
+
+
+async def wipe_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not _auth(update):
+        await q.answer("Unauthorized", show_alert=True)
+        return
+    _, arg = q.data.split(":")
+    await q.answer()
+    if arg == "yes":
+        db.wipe_all()
+        await q.edit_message_text("🗑 All local data deleted.")
+    else:
+        await q.edit_message_text("Canceled.")
+
+
+# ---------------- data lifecycle commands ----------------
+async def mydata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _auth(update):
         return
-    scs = db.list_shortcuts()
-    lines = ["⚡ <b>Kisayollar:</b>"]
-    for s in scs:
+    s = db.data_summary()
+    rng = ""
+    if s["hr_from"] and s["hr_to"]:
+        rng = f"\nHR range: {tzutil.fmt(s['hr_from'], '%d %b')} → {tzutil.fmt(s['hr_to'], '%d %b')}"
+    await update.message.reply_text(
+        f"🔐 <b>Your stored data</b> (all local)\n"
+        f"Events: {s['events']} · Participants: {s['participants']}\n"
+        f"HR samples: {s['hr_samples']}{rng}\n"
+        f"Official days: {s['daily_days']} · Workouts: {s['workouts']} · Shortcuts: {s['shortcuts']}\n\n"
+        f"Export: /export · Delete all: /deletemydata", parse_mode=ParseMode.HTML)
+
+
+async def _do_export(message, fmt):
+    path = export_mod.write_export(fmt)
+    with open(path, "rb") as f:
+        await message.reply_document(
+            f, filename=path.split("/")[-1].split("\\")[-1],
+            caption="⚠️ Contains your personal names, notes and heart-rate data — keep it private.")
+
+
+async def export_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update):
+        return
+    arg = (update.message.text.partition(" ")[2].strip() or "json").lower()
+    await _do_export(update.message, "csv" if arg.startswith("c") else "json")
+
+
+async def deletemydata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update):
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚠️ Yes, delete everything", callback_data="wipe:yes"),
+        InlineKeyboardButton("Cancel", callback_data="wipe:no")]])
+    await update.message.reply_text("This permanently deletes ALL local data. Continue?",
+                                    reply_markup=kb)
+
+
+# ---------------- shortcuts management (backward compatible) ----------------
+async def shortcuts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE, message=None):
+    if not _auth(update):
+        return
+    message = message or update.message
+    lines = ["⚡ <b>Shortcuts</b>"]
+    for s in db.list_shortcuts():
         lines.append(f"#{s['id']}  {html.escape(_label(s))}")
-    lines.append("\nEkle: /ekle Ad | etiket   (or. /ekle Sam | tatil)")
-    lines.append("Cikar: /cikar <id>")
-    await _send_html(update.message, "\n".join(lines))
+    lines.append("\nAdd: /add Name | context     Remove: /remove &lt;id&gt;")
+    await _send_html(message, "\n".join(lines))
 
 
-async def ekle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def add_shortcut_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _auth(update):
         return
     raw = update.message.text.partition(" ")[2].strip()
     if "|" not in raw:
-        await update.message.reply_text("Kullanim: /ekle Ad | etiket   (or. /ekle Sam | tatil)")
+        await update.message.reply_text("Usage: /add Name | context   (e.g. /add Sam | trip)")
         return
     friend, _, tag = raw.partition("|")
     status = db.add_shortcut(friend.strip(), tag.strip())
-    if status == "invalid":
-        await update.message.reply_text("Ad ve etiket bos olamaz.")
-        return
-    if status == "exists":
-        await update.message.reply_text(f"ℹ️ Zaten var: {friend.strip()}{SEP}{tag.strip()}")
-        return
-    await update.message.reply_text(
-        f"✅ Eklendi: {friend.strip()}{SEP}{tag.strip()}", reply_markup=_main_keyboard()
-    )
+    msg = {"invalid": "Name and context can't be empty.",
+           "exists": f"ℹ️ Already exists: {friend.strip()}{SEP}{tag.strip()}",
+           "added": f"✅ Added: {friend.strip()}{SEP}{tag.strip()}"}[status]
+    await update.message.reply_text(msg, reply_markup=_main_keyboard())
 
 
-async def cikar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def remove_shortcut_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _auth(update):
         return
     arg = update.message.text.partition(" ")[2].strip()
     if not arg.isdigit():
-        await update.message.reply_text("Kullanim: /cikar <id>  (id'leri /kisayollar ile gor)")
+        await update.message.reply_text("Usage: /remove <id>  (see ids with /shortcuts)")
         return
     ok = db.delete_shortcut(int(arg))
-    await update.message.reply_text(
-        f"🗑 Kisayol #{arg} silindi." if ok else f"#{arg} bulunamadi.",
-        reply_markup=_main_keyboard(),
-    )
+    await update.message.reply_text("🗑 Removed." if ok else "Not found.",
+                                    reply_markup=_main_keyboard())
+
+
+async def quick_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update):
+        return
+    raw = update.message.text.partition(" ")[2].strip()
+    if not raw:
+        await update.message.reply_text("Usage: /log Person | Place | Context")
+        return
+    p = [x.strip() or None for x in raw.split("|")]
+    friend, location, tag = (p + [None, None, None])[:3]
+    if friend:
+        db.add_name("friends", friend)
+    eid = _start_meeting(friend=friend, location=location, tag=tag)
+    await _open_card(update.message, ctx, eid)
+
+
+async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _auth(update):
+        return
+    arg = update.message.text.partition(" ")[2].strip()
+    if not arg.isdigit():
+        await update.message.reply_text("Usage: /delete <id>  (see ids with 🕘 Recent)")
+        return
+    ok = db.delete_event(int(arg))
+    await update.message.reply_text("🗑 Deleted." if ok else "Not found.")
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _auth(update):
-        await update.message.reply_text("Yetkisiz.")
+        await update.message.reply_text("Unauthorized.")
         return
-    await update.message.reply_text(
-        "👋 Stres logger hazir.\n\n"
-        "Alttaki <b>kisayol butonlarina</b> bas → o bulusma aninda baslar; "
-        "bitince <b>⏹ Bitir</b>.\n\n"
-        "/kisayollar — kisayollari yonet (/ekle, /cikar)\n"
-        "/klavye — klavyeyi tekrar goster\n"
-        "/meet — adim adim (his/konu ekle)\n"
-        "/log Kisi | Yer | Konu — hizli\n"
-        "/son · /sil &lt;id&gt; — kayitlar\n"
-        "/gun — bugunun Whoop baglami\n"
-        "/rapor — stres analizi",
-        parse_mode=ParseMode.HTML, reply_markup=_main_keyboard(),
-    )
+    await _send_html(update.message,
+                     "👋 <b>who-stresses-me-out</b>\n\n"
+                     "Log <i>who you were with</i> with one tap; the analysis correlates it with "
+                     "your WHOOP data. No mood or survey questions — associations only, not causes.\n\n"
+                     "Use the buttons below, or: /meet · /log · /shortcuts · /mydata · /export",
+                     reply_markup=_main_keyboard())
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await start(update, ctx)
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
-    log.exception("Handler hatasi", exc_info=ctx.error)
+    log.exception("Handler error", exc_info=ctx.error)
     try:
         if isinstance(update, Update) and update.effective_chat and _auth(update):
-            await ctx.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠ Bir hata olustu ama bot ayakta. Tekrar dene ya da /iptal yaz.",
-            )
+            await ctx.bot.send_message(chat_id=update.effective_chat.id,
+                                       text="⚠ Something went wrong, but the bot is fine. Try again.")
     except Exception:
         pass
+
+
+def _cmd(app, names, fn):
+    for n in names if isinstance(names, (list, tuple)) else [names]:
+        app.add_handler(CommandHandler(n, fn))
 
 
 def main():
@@ -505,32 +727,32 @@ def main():
                      MessageHandler(filters.TEXT & ~filters.COMMAND, friend_txt)],
             LOCATION: [CallbackQueryHandler(location_cb, pattern=r"^lo:"),
                        MessageHandler(filters.TEXT & ~filters.COMMAND, location_txt)],
-            TOPIC: [CommandHandler("atla", topic_skip),
+            TOPIC: [CommandHandler("skip", topic_skip),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, topic_txt)],
-            FEELING: [CallbackQueryHandler(feeling_cb, pattern=r"^fe:"),
-                      MessageHandler(filters.TEXT & ~filters.COMMAND, feeling_txt)],
             ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, conv_timeout)],
         },
-        fallbacks=[CommandHandler("iptal", cancel), CommandHandler("cancel", cancel)],
-        conversation_timeout=CONV_TIMEOUT,
-        allow_reentry=True,
+        fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=CONV_TIMEOUT, allow_reentry=True,
     )
     app.add_handler(conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("klavye", klavye))
-    app.add_handler(CommandHandler("kisayollar", kisayollar))
-    app.add_handler(CommandHandler("ekle", ekle))
-    app.add_handler(CommandHandler("cikar", cikar))
-    app.add_handler(CommandHandler("log", quick_log))
-    app.add_handler(CommandHandler("bitir", bitir))
-    app.add_handler(CommandHandler("son", son))
-    app.add_handler(CommandHandler("sil", sil))
-    app.add_handler(CommandHandler("gun", gun))
-    app.add_handler(CommandHandler("rapor", rapor))
-    # Kalici klavye metinleri (kisayol taplari + ⏹ Bitir): en son, konusma aktif degilken yakalar
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, shortcut_tap))
+    _cmd(app, ["start", "help"], start)
+    _cmd(app, "log", quick_log)
+    _cmd(app, ["shortcuts", "kisayollar"], shortcuts_cmd)
+    _cmd(app, ["add", "ekle"], add_shortcut_cmd)
+    _cmd(app, ["remove", "cikar"], remove_shortcut_cmd)
+    _cmd(app, ["delete", "sil"], delete_cmd)
+    _cmd(app, ["mydata", "verilerim"], mydata)
+    _cmd(app, ["export", "disaaktar"], export_cmd)
+    _cmd(app, ["deletemydata", "verilerimisil"], deletemydata)
+    app.add_handler(CallbackQueryHandler(card_cb, pattern=r"^card:"))
+    app.add_handler(CallbackQueryHandler(xc_cb, pattern=r"^xc:"))
+    app.add_handler(CallbackQueryHandler(report_cb, pattern=r"^rep:"))
+    app.add_handler(CallbackQueryHandler(recent_cb, pattern=r"^rec:"))
+    app.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^set:"))
+    app.add_handler(CallbackQueryHandler(wipe_cb, pattern=r"^wipe:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(on_error)
-    log.info("bot calisiyor…")
+    log.info("bot running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

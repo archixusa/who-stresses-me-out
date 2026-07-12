@@ -1,9 +1,12 @@
-"""Sentetik veriyle db + analyze + report'u dogrular. Whoop/Telegram gerekmez.
+"""End-to-end smoke test on synthetic data (no WHOOP/Telegram/network needed).
 
-Kapsam: yeni on-pencere baseline (uykuyu haric), workout dislama, HTML escaping,
-yerel saat gosterimi, his-uyumu, kucuk-orneklem geri cekme, DB hijyen metodlari.
+Verifies the reshaped pipeline: association analysis with evidence levels + bootstrap CI,
+multi-participant events, confounder flags, matched-control field, that the legacy `feeling`
+field is never written or surfaced, report language is non-causal & feeling-free, plus
+export and the old-DB migration path. Detailed unit tests live in tests/ (pytest).
 """
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,13 +16,16 @@ os.environ.setdefault("LOCAL_TZ", "Europe/Istanbul")
 for f in ("_smoketest.db", "_smoketest.db-wal", "_smoketest.db-shm"):
     if os.path.exists(f):
         os.remove(f)
-
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-import db, analyze, report
+import analyze
+import bot
+import db
+import export
+import report
 
 IST = ZoneInfo("Europe/Istanbul")
 db.init_db()
@@ -29,218 +35,94 @@ def ep(y, m, d, hh, mm=0):
     return int(datetime(y, m, d, hh, mm, tzinfo=IST).timestamp())
 
 
-def fill(day_ep_0, from_min, to_min, bpm):
-    db.upsert_hr([(day_ep_0 + t * 60, bpm) for t in range(from_min, to_min)])
+def fill(day0, from_min, to_min, bpm):
+    db.upsert_hr([(day0 + t * 60, bpm) for t in range(from_min, to_min)])
 
 
-# --- Gun 1: 2026-07-10, gece dusuk (uyku 50), gunduz dinlenme 65 ---
 g1 = ep(2026, 7, 10, 0)
-fill(g1, 0, 7 * 60, 50)         # 00:00-07:00 uyku
-fill(g1, 7 * 60, 24 * 60, 65)   # 07:00-24:00 dinlenme
-fill(g1, 15 * 60, 16 * 60, 70)  # Leo 15:00-16:00 hafif
-fill(g1, 22 * 60, 23 * 60, 95)  # Nate 22:00-23:00 yuksek
+fill(g1, 0, 7 * 60, 50)          # sleep
+fill(g1, 7 * 60, 24 * 60, 65)    # awake resting
+fill(g1, 15 * 60, 16 * 60, 92)   # Sam high
+fill(g1, 18 * 60, 19 * 60, 68)   # group mild
 
-# --- Gun 2: 2026-07-11, workout dislama testi ---
-g2 = ep(2026, 7, 11, 0)
-fill(g2, 0, 7 * 60, 50)
-fill(g2, 7 * 60, 24 * 60, 65)
-fill(g2, 18 * 60, 18 * 60 + 30, 140)   # 18:00-18:30 SPOR (yuksek)
-fill(g2, 18 * 60 + 30, 19 * 60, 72)    # 18:30-19:00 cooldown
-db.upsert_workout("wk1", ep(2026, 7, 11, 18), ep(2026, 7, 11, 18, 30), "running", 12.0)
-
-# Events (Nate adinda kasitli Markdown/HTML tehlikeli karakter var)
-db.add_event(ts_start=ep(2026, 7, 10, 22), ts_end=ep(2026, 7, 10, 23),
-             friend="Nate_<b>x", location="Cafe", topic="debt_talk", feeling=5, created_at=g1)
-db.add_event(ts_start=ep(2026, 7, 10, 15), ts_end=ep(2026, 7, 10, 16),
-             friend="Leo", location="Park", topic="football", feeling=2, created_at=g1)
-db.add_event(ts_start=ep(2026, 7, 11, 18), ts_end=ep(2026, 7, 11, 19),
-             friend="Gym", location="Studio", topic="run", feeling=3, created_at=g2)
+# Sam · ex — single-participant, high signal
+e1 = db.add_event(ts_start=ep(2026, 7, 10, 15), ts_end=ep(2026, 7, 10, 16),
+                  participants=["Sam"], location="Cafe", tag="ex", created_at=g1)
+# Group meeting (2 participants) — attribution must be limited
+e2 = db.add_event(ts_start=ep(2026, 7, 10, 18), ts_end=ep(2026, 7, 10, 19),
+                  participants=["Alex", "Jordan"], tag="work", created_at=g1)
+db.set_event_confounders(e2, alcohol=1)  # confounder flag
 
 res = analyze.run(g1 - 86400)
-by = {r["name"]: r for r in res["by_friend"]}
-ev = {e["friend"]: e for e in res["events"]}
-
 print("=== analyze ===")
-for r in res["by_friend"]:
-    print(f"  {r['name']}: avg +{r['avg_elev']} adj +{r['adj_elev']} n={r['count']}")
-for e in res["events"]:
-    print(f"  [{e['friend']}] baseline={e['baseline']} ({e['base_method']}) "
-          f"elev={e['elev']} wo_excl={e['workout_excluded']}")
+for r in res["by_context"]:
+    print(f"  {r['name']}: elev {r['avg_elev']} evidence={r['evidence']} ci={r['ci']} "
+          f"group_frac={r['group_frac']} conf={r['confounded_frac']}")
 
-# 1) On-pencere baseline uykuyu HARIC tutmali -> Nate baseline ~65 (50 degil)
-assert ev["Nate_<b>x"]["base_method"] == "on-pencere", "on-pencere baseline kullanilmali"
-assert 63 <= ev["Nate_<b>x"]["baseline"] <= 67, f"baseline uyku sizdirdi: {ev['Nate_<b>x']['baseline']}"
-# 2) Nate (yuksek) Leo'ten (hafif) yuksek siralanmali
-assert res["by_friend"][0]["name"] == "Nate_<b>x"
-assert by["Nate_<b>x"]["avg_elev"] > by["Leo"]["avg_elev"]
-# 3) Workout dislama: ilk 10dk trim (18:00-18:10) sonra workout 18:10-18:30 = 20 ornek
-assert ev["Gym"]["workout_excluded"] == 20, f"workout dislanmadi: {ev['Gym']['workout_excluded']}"
-# Gym elev'i cooldown (72) uzerinden hesaplanmali, 140 spike'i degil
-assert ev["Gym"]["elev"] < 15, f"spor spike'i sizdi: {ev['Gym']['elev']}"
-# 4) His-uyumu hesaplandi
-assert res["feeling_agreement"] is not None and res["feeling_agreement"]["n"] == 3
+evby = {r["name"]: r for r in res["by_context"]}
+evev = {e["primary"]: e for e in res["events"]}
+
+# 1) No feeling anywhere
+assert all("feeling" not in e for e in res["events"]), "feeling leaked into analysis"
+assert "feeling_agreement" not in res, "feeling_agreement must be gone"
+# 2) Evidence + CI present on every group
+for r in res["by_context"]:
+    assert "evidence" in r and "ci" in r and "coverage" in r
+# 3) Multi-participant event flagged
+assert evev["Alex"]["is_group"] is True and len(evev["Alex"]["participants"]) == 2
+assert evev["Sam"]["is_group"] is False
+# 4) Confounder detected on the group event
+assert evev["Alex"]["confounded"] is True
+# 5) matched-control field exists (may be None without control data)
+assert "control_elev" in evev["Sam"]
+print("analyze invariants: OK")
 
 rep = report.build_report(days=30)
-print("\n=== report ===")
-print(rep)
+print("\n=== report (head) ===")
+print("\n".join(rep.splitlines()[:6]))
+low = rep.lower()
+assert "associations, not causes" in low, "non-causal disclaimer missing"
+for banned in ("feeling", "mood", "how did you feel", "1-5", "tension"):
+    assert banned not in low, f"banned emotion language present: {banned}"
+print("report language: OK (non-causal, feeling-free)")
 
-# 5) HTML escaping: tehlikeli kullanici metni kacisli olmali (ham <b> raporu bozmasin)
-assert "&lt;b&gt;" in rep, "kullanici <b> kacislanmadi (Markdown/HTML cokme riski)"
-assert "Nate_&lt;b&gt;x" in rep, "kullanici adi beklendigi gibi kacislanmadi"
-# 6) Yerel saat: Nate event'i 22:00 Istanbul -> raporda 22:00 (UTC 19:00 DEGIL)
-assert "22:00" in rep, "yerel saat gosterilmiyor"
+# --- export ---
+path = export.write_export("json")
+assert os.path.exists(path)
+import json as _json
+data = _json.load(open(path, encoding="utf-8"))
+assert data["events"] and "participants" in data["events"][0]
+os.remove(path)
+print("export: OK")
 
-# --- DB hijyen metodlari ---
-print("\n=== db hijyen ===")
-rec = db.recent_events(10)
-assert len(rec) == 3
-# OldA acik event -> too_old
-old_open = db.add_event(ts_start=ep(2026, 7, 8, 12), friend="OldA", created_at=g1)
-eid, status = db.close_latest_open_event(ep(2026, 7, 12, 12), 240 * 60)
-assert status == "too_old", f"eski acik event korunmali: {status}"
-# Fresh acik event -> ok
-import time as _t
-db.add_event(ts_start=int(_t.time()) - 60, friend="Fresh")
-eid2, status2 = db.close_latest_open_event(int(_t.time()), 240 * 60)
-assert status2 == "ok", f"yeni acik event kapanmali: {status2}"
-# delete
-assert db.delete_event(old_open) is True
-assert db.delete_event(999999) is False
-print("recent_events, close(too_old/ok), delete: OK")
-
-# --- HR chunk tiling: bosluksuz, <=7 gun, ust uste binmez ---
-import whoop_source, bot
-from datetime import date, timedelta
-
-wins = whoop_source.tile_windows("2026-07-01", "2026-07-20", 7)
-days = []
-for s, e in wins:
-    ds = date.fromisoformat(s)
-    de = date.fromisoformat(e)
-    span = (de - ds).days + 1
-    assert span <= 7, f"pencere 7 gunu asti: {s}..{e} ({span})"
-    d = ds
-    while d <= de:
-        days.append(d)
-        d += timedelta(days=1)
-assert days == sorted(days), "pencereler sirali degil"
-assert len(days) == len(set(days)), "pencereler ust uste bindi"
-full = [date(2026, 7, 1) + timedelta(days=i) for i in range(20)]
-assert days == full, "tiling [d0,d1]'i tam dosemedi (bosluk var)"
-print(f"tile_windows: {len(wins)} pencere, 1-20 Tem tam doseme OK")
-
-# --- render-id: eski klavye tapi reddedilmeli ---
-from types import SimpleNamespace
-fake = SimpleNamespace(user_data={"fr_rid": 5, "snap_5": ["A", "B"]})
-assert bot._resolve(fake, "fr", "fr:5:i:1") == ("pick", "B")
-assert bot._resolve(fake, "fr", "fr:4:i:1") == ("expired", None)   # eski rid
-assert bot._resolve(fake, "fr", "fr:5:i:9") == ("pick", None)      # aralik disi
-assert bot._resolve(fake, "fr", "fr:5:new")[0] == "new"
-print("render-id resolve (pick/expired/aralik-disi/new): OK")
-
-# --- set_event_topic ---
-tid = db.add_event(ts_start=int(_t.time()) - 30, friend="Ted")
-db.set_event_topic(tid, "updated topic")
-assert any(e["id"] == tid and e["topic"] == "updated topic" for e in db.recent_events(5))
-print("set_event_topic: OK")
-
-# --- kisayollar + tag/baglam boyutu ---
-scs = db.list_shortcuts()
-assert len(scs) == 7, f"varsayilan kisayol sayisi: {len(scs)}"
-assert any(s["friend"] == "Sam" and s["tag"] == "ex" for s in scs), "Sam·ex seed yok"
-assert db.add_shortcut("Test", "x") == "added"
-assert db.add_shortcut("Test", "x") == "exists"   # duplicate -> yaniltici basari yok
-assert db.add_shortcut("", "x") == "invalid"
-sid = [s["id"] for s in db.list_shortcuts() if s["friend"] == "Test"][0]
-assert db.delete_shortcut(sid) is True
-assert analyze.context_label("Sam", "ex") == "Sam · ex"
-assert analyze.context_label("Nate", None) == "Nate"
-print("kisayollar (added/exists/invalid/delete) + context_label: OK")
-
-# re-seed marker: hepsini sil -> init_db tekrar -> geri GELMEMELI
-for s in db.list_shortcuts():
-    db.delete_shortcut(s["id"])
-db.init_db()
-assert len(db.list_shortcuts()) == 0, "silinen kisayollar yeniden yuklendi (marker bug)"
-print("re-seed marker (silinen geri gelmiyor): OK")
-
-# close_open_events: yakin -> now, cok eski -> start+default
-now = int(_t.time())
-db.close_open_events(now, 240 * 60, 90 * 60)                     # onceki testlerden kalanlari temizle
-db.add_event(ts_start=now - 60, friend="Recent")                 # yakin acik
-db.add_event(ts_start=now - 10 * 3600, friend="OldB")          # 10 saat once acik (stale)
-r = db.close_open_events(now, 240 * 60, 90 * 60)
-assert r["closed"] == 2 and r["stale"] == 1, f"close_open_events: {r}"
-assert not any(e["ts_end"] is None for e in db.recent_events(10)), "acik event kaldi (orphan)"
-print("close_open_events (orphan supurme): OK")
-
-# tag'li event -> by_context ayrimi
-tt = int(_t.time())
-db.add_event(ts_start=ep(2026, 7, 10, 15), ts_end=ep(2026, 7, 10, 16),
-             friend="Sam", tag="ex", topic="x", created_at=tt)
-# Gun-1 15:00-16:00 icin HR zaten dolu (65 baseline, 70 event) -> analiz eslesir
-res2 = analyze.run(g1 - 86400)
-ctx_names = [r["name"] for r in res2["by_context"]]
-assert "Sam · ex" in ctx_names, f"baglam ayrimi yok: {ctx_names}"
-print("by_context (Sam · ex ayri): OK")
-
-# bot importu (yeni handler'lar + kisayol klavyesi kurulumu)
-db.add_shortcut("Sam", "ex")   # marker testi sildi, geri ekle
+# --- bot helpers still pure/importable ---
 assert bot._label({"friend": "Sam", "tag": "ex"}) == "Sam · ex"
-assert bot._find_shortcut("Sam · ex") is not None
-assert bot._find_shortcut("yok · yok") is None
-print("bot kisayol yardimcilari: OK")
+assert callable(bot._main_keyboard)
+print("bot helpers: OK")
 
-# --- auto-source: dis kaynak dedup (upsert_external_event) ---
-r1 = db.upsert_external_event("google_calendar", "evt_1", now - 3600, now - 1800,
-                              friend="Colleague", topic="1:1", tag="work")
-assert r1 == "inserted"
-r2 = db.upsert_external_event("google_calendar", "evt_1", now - 3600, now - 1700,
-                              friend="Colleague", topic="1:1 (moved)", tag="work")
-assert r2 == "updated"  # ayni ext_id -> cift eklenmez, guncellenir
-dup = [e for e in db.recent_events(30) if e.get("ext_id") == "evt_1"]
-assert len(dup) == 1 and dup[0]["topic"] == "1:1 (moved)"
-print("upsert_external_event (insert/dedup-update): OK")
+# --- old-DB migration path (no tag/source/participants/confounders) ---
+OLD = "_smoke_old.db"
+for f in (OLD, OLD + "-wal", OLD + "-shm"):
+    if os.path.exists(f):
+        os.remove(f)
+c = sqlite3.connect(OLD)
+c.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start INTEGER NOT NULL, "
+          "ts_end INTEGER, friend TEXT, location TEXT, topic TEXT, feeling INTEGER, created_at INTEGER NOT NULL)")
+c.execute("INSERT INTO events(ts_start, friend, feeling, created_at) VALUES (100,'Legacy',4,100)")
+c.commit(); c.close()
+os.environ["DB_PATH"] = OLD
+import importlib
+import config as _cfg
+importlib.reload(_cfg)          # config.DB_PATH -> OLD (db reads it fresh per call)
+db.init_db()
+with db.get_conn() as _c:
+    cols = [r["name"] for r in _c.execute("PRAGMA table_info(events)").fetchall()]
+assert {"tag", "source", "ext_id", "caffeine", "alcohol", "illness", "commute", "notes"} <= set(cols)
+parts = db.get_event_participants(1)
+assert parts and parts[0]["name"] == "Legacy", "friend not backfilled to participants"
+print("old-DB migration + participant backfill: OK")
+for f in (OLD, OLD + "-wal", OLD + "-shm", "_smoketest.db", "_smoketest.db-wal", "_smoketest.db-shm"):
+    if os.path.exists(f):
+        os.remove(f)
 
-# --- google_calendar eslemesi (saf/agsiz) ---
-from sources import google_calendar as gc
-m = gc.event_to_meeting({
-    "id": "g1", "summary": "Sync",
-    "start": {"dateTime": "2026-07-10T14:00:00+03:00"},
-    "end": {"dateTime": "2026-07-10T14:30:00+03:00"},
-    "attendees": [{"self": True, "responseStatus": "accepted"},
-                  {"displayName": "Dana", "email": "dana@x.com", "responseStatus": "accepted"}],
-})
-assert m and m.person == "Dana" and m.title == "Sync" and m.tag == "work"
-assert m.ts_end - m.ts_start == 1800
-assert gc.event_to_meeting({"id": "g2", "start": {"date": "2026-07-10"},
-                            "end": {"date": "2026-07-11"}}) is None  # tum-gun
-assert gc.event_to_meeting({"id": "g3",
-    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T09:15:00Z"},
-    "attendees": [{"self": True}]}) is None  # tek kisilik
-assert gc.event_to_meeting({"id": "g4",
-    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T10:00:00Z"},
-    "attendees": [{"self": True, "responseStatus": "declined"}, {"displayName": "X"}]}) is None  # reddedilmis
-print("google_calendar.event_to_meeting (map/skip): OK")
-
-# --- slack kumeleme (saf) ---
-from sources import slack
-cl = slack.cluster([100, 130, 160, 100000, 100050], 60)
-assert len(cl) == 2 and cl[0][2] == 3 and cl[1][2] == 2
-print("slack.cluster: OK")
-
-# --- delete_external_window (replace-window semantigi) ---
-db.upsert_external_event("slack", "C:1", now - 100, now - 50, friend="X")
-db.upsert_external_event("slack", "C:2", now - 40, now - 10, friend="X")
-assert db.delete_external_window("slack", now - 1000, now) == 2
-assert not [e for e in db.recent_events(40) if e.get("source") == "slack"]
-assert db.delete_external_window("slack", now - 1000, now) == 0  # bos pencere
-print("delete_external_window (replace-window): OK")
-
-# id'siz calendar event -> None (dedup korumasi)
-assert gc.event_to_meeting({
-    "start": {"dateTime": "2026-07-10T09:00:00Z"}, "end": {"dateTime": "2026-07-10T10:00:00Z"},
-    "attendees": [{"self": True}, {"displayName": "Y"}]}) is None
-print("event_to_meeting id-guard: OK")
-
-print("\n✅ TUM KONTROLLER GECTI")
+print("\n✅ ALL SMOKE CHECKS PASSED")
