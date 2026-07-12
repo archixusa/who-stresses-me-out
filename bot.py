@@ -9,18 +9,25 @@ Product rules enforced in the UI:
 """
 import asyncio
 import html
-import json
 import logging
 import time
 
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardMarkup, Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, ConversationHandler,
-    CallbackQueryHandler, MessageHandler, filters,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 import config

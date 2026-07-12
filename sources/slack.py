@@ -17,6 +17,7 @@ import time
 import requests
 
 import config
+
 from . import Meeting
 
 API = "https://slack.com/api"

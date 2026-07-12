@@ -10,9 +10,10 @@ Setup (see docs/AUTO_SOURCES_SETUP.md):
   2. First run opens a browser to authorize (scope: calendar.readonly); the token is
      cached at GOOGLE_TOKEN_PATH.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import config
+
 from . import Meeting
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
@@ -65,9 +66,10 @@ def event_to_meeting(ev):
 
 def _service():
     import os
+
+    from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
 
     creds = None
@@ -87,7 +89,7 @@ def _service():
 def fetch(days=None):
     days = days or config.SYNC_DAYS
     svc = _service()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     time_min = (now - timedelta(days=days)).isoformat()
     time_max = now.isoformat()
 

@@ -7,19 +7,18 @@ Resmi API "Stres Monitoru" skorunu VERMEZ; stres yine dakikalik HR proxy'sinden 
 Kurulum: developer.whoop.com'da uygulama olustur (redirect URI: WHOOP_REDIRECT_URI),
 Client ID/Secret'i .env'e yaz, sonra bir kez:  python whoop_oauth.py login
 """
-import json
-import os
 import secrets
 import time
 import urllib.parse
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
 import config
 import db
+import secrets_store
 import tzutil
 
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
@@ -30,21 +29,17 @@ _TIMEOUT = 30
 
 
 # ---------------- token store ----------------
+_TOKEN_KEY = "whoop_oauth_tokens"
+
+
 def _load_tokens():
-    if not os.path.exists(config.TOKEN_STORE_PATH):
-        return None
-    with open(config.TOKEN_STORE_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    # OS keyring tercih edilir; eski whoop_tokens.json otomatik migrate edilir
+    return secrets_store.get_blob(_TOKEN_KEY, config.TOKEN_STORE_PATH)
 
 
 def _save_tokens(tok):
     tok = {**tok, "obtained_at": tzutil.now_ts()}
-    with open(config.TOKEN_STORE_PATH, "w", encoding="utf-8") as f:
-        json.dump(tok, f, indent=2)
-    try:
-        os.chmod(config.TOKEN_STORE_PATH, 0o600)  # Windows'ta sinirli ama zararsiz
-    except OSError:
-        pass
+    secrets_store.set_blob(_TOKEN_KEY, tok, config.TOKEN_STORE_PATH)
 
 
 def _store_from_response(resp_json):
@@ -146,7 +141,7 @@ def _access_token():
 
 # ---------------- REST ----------------
 def _iso(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _iso_to_epoch(s):
@@ -206,8 +201,7 @@ def _paginate(path, start_ts, end_ts):
         data = _get(path, params)
         if not data:
             return
-        for rec in data.get("records", []):
-            yield rec
+        yield from data.get("records", [])
         nxt = data.get("next_token")
         if not nxt:
             return

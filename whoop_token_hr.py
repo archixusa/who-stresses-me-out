@@ -16,7 +16,7 @@ otomatik dakikalik moda gecer.
 """
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import config
 import db
@@ -39,12 +39,21 @@ def _client_with_token(token):
     return c
 
 
+def _clean_token(tok):
+    tok = (tok or "").strip()
+    return tok[7:].strip() if tok.lower().startswith("bearer ") else tok
+
+
 def _read_token():
+    # 1) ONCE ortam degiskeni (tercih edilen)
+    if config.WHOOP_ACCESS_TOKEN:
+        return _clean_token(config.WHOOP_ACCESS_TOKEN)
+    # 2) whoop_token.txt (dosya fallback) — kullanimdan sonra silinmesi onerilir
     if os.path.exists(TOKEN_FILE):
+        print(f"[hr] UYARI: jeton {TOKEN_FILE} dosyasindan okundu (duz metin). "
+              f"WHOOP_ACCESS_TOKEN ortam degiskenini tercih et ve bu dosyayi kullanimdan sonra sil.")
         with open(TOKEN_FILE, encoding="utf-8") as f:
-            tok = f.read().strip()
-        # "Bearer xxx" yapistirilirsa temizle
-        return tok[7:].strip() if tok.lower().startswith("bearer ") else tok
+            return _clean_token(f.read())
     return None
 
 
@@ -63,7 +72,7 @@ def run(days=None):
         print(f"Jeton gecersiz veya dolmus olabilir — tarayicidan tazele: {e}")
         return 0
 
-    end = datetime.now(timezone.utc).date()
+    end = datetime.now(UTC).date()
     start = end - timedelta(days=days)
     total = 0
     for s, e in whoop_source.tile_windows(

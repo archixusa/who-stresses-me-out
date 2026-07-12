@@ -90,6 +90,7 @@ print("report language: OK (non-causal, feeling-free)")
 path = export.write_export("json")
 assert os.path.exists(path)
 import json as _json
+
 data = _json.load(open(path, encoding="utf-8"))
 assert data["events"] and "participants" in data["events"][0]
 os.remove(path)
@@ -109,10 +110,13 @@ c = sqlite3.connect(OLD)
 c.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start INTEGER NOT NULL, "
           "ts_end INTEGER, friend TEXT, location TEXT, topic TEXT, feeling INTEGER, created_at INTEGER NOT NULL)")
 c.execute("INSERT INTO events(ts_start, friend, feeling, created_at) VALUES (100,'Legacy',4,100)")
-c.commit(); c.close()
+c.commit()
+c.close()
 os.environ["DB_PATH"] = OLD
 import importlib
+
 import config as _cfg
+
 importlib.reload(_cfg)          # config.DB_PATH -> OLD (db reads it fresh per call)
 db.init_db()
 with db.get_conn() as _c:

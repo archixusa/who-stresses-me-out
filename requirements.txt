@@ -3,3 +3,4 @@ whoop-data>=1.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 tzdata>=2024.1
+keyring>=24.0            # OS-encrypted token storage (falls back to a file if no backend)

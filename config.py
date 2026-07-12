@@ -1,5 +1,6 @@
 """Ortam degiskenlerini tek yerden yukler ve dogrular."""
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -59,6 +60,9 @@ MATCHED_CONTROL_HALFWIN_MIN = int(_get("MATCHED_CONTROL_HALFWIN_MIN", "90"))  # 
 DB_PATH = _get("DB_PATH", "whoop_stress.db")
 SYNC_DAYS = int(_get("SYNC_DAYS", "8"))
 HR_WINDOW_DAYS = int(_get("HR_WINDOW_DAYS", "7"))            # gayriresmi HR API pencere limiti
+HR_PROVIDER = _get("HR_PROVIDER", "unofficial")             # unofficial | none (token yolu manuel)
+# Gayriresmi HR icin jeton: ONCE env, yoksa whoop_token.txt (kullanimdan sonra sil)
+WHOOP_ACCESS_TOKEN = _get("WHOOP_ACCESS_TOKEN")
 
 
 def require_bot():
