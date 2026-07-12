@@ -1,0 +1,63 @@
+"""Ortam degiskenlerini tek yerden yukler ve dogrular."""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _get(name, default=None, required=False):
+    val = os.getenv(name, default)
+    if required and not val:
+        raise RuntimeError(f"Eksik ortam degiskeni: {name} -> .env dosyasini doldur")
+    return val
+
+
+# --- Telegram (bot icin zorunlu) ---
+TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _get("TELEGRAM_CHAT_ID")
+
+# --- Whoop gayriresmi (dakikalik HR) ---
+WHOOP_EMAIL = _get("WHOOP_EMAIL")
+WHOOP_PASSWORD = _get("WHOOP_PASSWORD")
+
+# --- Whoop resmi OAuth (Faz 2, opsiyonel) ---
+WHOOP_CLIENT_ID = _get("WHOOP_CLIENT_ID")
+WHOOP_CLIENT_SECRET = _get("WHOOP_CLIENT_SECRET")
+WHOOP_REDIRECT_URI = _get("WHOOP_REDIRECT_URI", "http://localhost:8080/callback")
+TOKEN_STORE_PATH = _get("TOKEN_STORE_PATH", "whoop_tokens.json")
+
+# --- Zaman dilimi (raporlarda yerel saat) ---
+LOCAL_TZ = _get("LOCAL_TZ", "Europe/Istanbul")
+
+# --- Analiz ayarlari ---
+DEFAULT_WINDOW_MIN = int(_get("DEFAULT_WINDOW_MIN", "90"))
+MAX_WINDOW_MIN = int(_get("MAX_WINDOW_MIN", "240"))          # /bitir gec kalirsa tavan
+TRIM_MINUTES = int(_get("TRIM_MINUTES", "10"))               # pencere basindan (varis/yuruyus) kirp
+BASELINE_PRE_MIN = int(_get("BASELINE_PRE_MIN", "90"))       # bulusma oncesi dinlenme penceresi
+MIN_BASELINE_SAMPLES = int(_get("MIN_BASELINE_SAMPLES", "10"))
+MIN_EVENT_SAMPLES = int(_get("MIN_EVENT_SAMPLES", "5"))
+ELEVATION_THRESHOLD_BPM = int(_get("ELEVATION_THRESHOLD_BPM", "12"))
+SHRINK_K = int(_get("SHRINK_K", "2"))                        # kucuk-orneklem geri cekme gucu
+
+# --- Sync ---
+DB_PATH = _get("DB_PATH", "whoop_stress.db")
+SYNC_DAYS = int(_get("SYNC_DAYS", "8"))
+HR_WINDOW_DAYS = int(_get("HR_WINDOW_DAYS", "7"))            # gayriresmi HR API pencere limiti
+
+
+def require_bot():
+    """Bot baslarken cagir: zorunlu Telegram degiskenlerini dogrular."""
+    _get("TELEGRAM_BOT_TOKEN", required=True)
+    _get("TELEGRAM_CHAT_ID", required=True)
+
+
+def require_hr():
+    """Gayriresmi HR sync'i baslarken cagir."""
+    _get("WHOOP_EMAIL", required=True)
+    _get("WHOOP_PASSWORD", required=True)
+
+
+def require_oauth():
+    """Resmi API'yi kullanirken cagir."""
+    _get("WHOOP_CLIENT_ID", required=True)
+    _get("WHOOP_CLIENT_SECRET", required=True)

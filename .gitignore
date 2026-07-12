@@ -1,0 +1,11 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.venv/
+venv/
+hr_sample_debug.json
+whoop_tokens.json
+whoop_token.txt
